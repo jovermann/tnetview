@@ -1,0 +1,1374 @@
+// Misc utility functions.
+//
+// Copyright (c) 2021-2025 Johannes Overmann
+//
+// Distributed under the Boost Software License, Version 1.0.
+// (See accompanying file LICENSE or copy at https://www.boost.org/LICENSE_1_0.txt)
+
+#ifndef _WIN32
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#endif
+#ifdef __APPLE__
+#include <sys/disk.h> // for DKIOCGETBLOCKCOUNT and DKIOCGETBLOCKSIZE
+#endif
+#ifdef __linux__
+#include <linux/fs.h> // for BLKGETSIZE64
+#endif
+#include "MiscUtils.hpp"
+#include "UnitTest.hpp"
+#include <cerrno>
+#include <cstring>
+#include <iostream>
+#include <array>
+#include <chrono>
+#include <format>
+#include <iomanip>
+#include <utility>
+
+
+namespace ut1
+{
+
+static std::string compilerDateToIso(std::string_view date)
+{
+    const std::string monthName(date.substr(0, 3));
+    std::string month = "01";
+    if (monthName == "Feb") { month = "02"; }
+    else if (monthName == "Mar") { month = "03"; }
+    else if (monthName == "Apr") { month = "04"; }
+    else if (monthName == "May") { month = "05"; }
+    else if (monthName == "Jun") { month = "06"; }
+    else if (monthName == "Jul") { month = "07"; }
+    else if (monthName == "Aug") { month = "08"; }
+    else if (monthName == "Sep") { month = "09"; }
+    else if (monthName == "Oct") { month = "10"; }
+    else if (monthName == "Nov") { month = "11"; }
+    else if (monthName == "Dec") { month = "12"; }
+    std::string day(date.substr(4, 2));
+    if (day[0] == ' ')
+    {
+        day[0] = '0';
+    }
+    return std::string(date.substr(7, 4)) + "-" + month + "-" + day;
+}
+
+
+std::string getCompileDate()
+{
+    return compilerDateToIso(__DATE__);
+}
+
+
+UNIT_TEST(getCompileDate)
+{
+    ASSERT_EQ(compilerDateToIso("Jan  1 2026"), "2026-01-01");
+    ASSERT_EQ(compilerDateToIso("May 22 2026"), "2026-05-22");
+    ASSERT_EQ(compilerDateToIso("Dec 31 2026"), "2026-12-31");
+
+    const std::string compileDate = getCompileDate();
+    ASSERT_EQ(compileDate.size(), size_t(10));
+    ASSERT_EQ(compileDate[4], '-');
+    ASSERT_EQ(compileDate[7], '-');
+}
+
+
+bool hasPrefix(const std::string& s, const std::string& prefix) noexcept
+{
+    return s.compare(0, prefix.length(), prefix) == 0;
+}
+
+
+UNIT_TEST(hasPrefix)
+{
+    ASSERT_EQ(hasPrefix("foobar", "foo"), true);
+    ASSERT_EQ(hasPrefix("foobar", "bar"), false);
+    ASSERT_EQ(hasPrefix("foobar", ""), true);
+    ASSERT_EQ(hasPrefix("", "bar"), false);
+    ASSERT_EQ(hasPrefix("foo", "foobar"), false);
+}
+
+
+bool hasSuffix(const std::string& s, const std::string& suffix) noexcept
+{
+    if (suffix.length() > s.length())
+    {
+        return false;
+    }
+    return s.compare(s.length() - suffix.length(), suffix.length(), suffix) == 0;
+}
+
+
+UNIT_TEST(hasSuffix)
+{
+    ASSERT_EQ(hasSuffix("foobar", "foo"), false);
+    ASSERT_EQ(hasSuffix("foobar", "bar"), true);
+    ASSERT_EQ(hasSuffix("foobar", ""), true);
+    ASSERT_EQ(hasSuffix("", "bar"), false);
+    ASSERT_EQ(hasSuffix("bar", "foobar"), false);
+}
+
+
+bool contains(const std::string& s, char c) noexcept
+{
+    return s.find(c) != std::string::npos;
+}
+
+
+UNIT_TEST(contains)
+{
+    ASSERT_EQ(contains("abc", 'd'), false);
+    ASSERT_EQ(contains("abc", 'b'), true);
+    ASSERT_EQ(contains("", 'b'), false);
+    ASSERT_EQ(contains("abc", '\0'), false);
+    ASSERT_EQ(contains(std::string("ab\0c", 4), '\0'), true);
+}
+
+
+bool contains(const std::string& haystack, const std::string& needle) noexcept
+{
+    return haystack.find(needle) != std::string::npos;
+}
+
+
+UNIT_TEST(containsStr)
+{
+    ASSERT_EQ(contains("abc", "abcd"), false);
+    ASSERT_EQ(contains("abcd", "abc"), true);
+    ASSERT_EQ(contains("abc", "abc"), true);
+    ASSERT_EQ(contains("abc", ""), true);
+    ASSERT_EQ(contains("", ""), true);
+    ASSERT_EQ(contains(std::string("ab\0c", 4), "\0"), true);
+    ASSERT_EQ(contains(std::string("ab\0c", 4), "c"), true);
+}
+
+
+void replaceStringInPlace(std::string& s, const std::string& from, const std::string& to)
+{
+    if (!from.empty())
+    {
+        for (size_t pos = 0;; pos += to.size())
+        {
+            pos = s.find(from, pos);
+            if (pos == std::string::npos)
+            {
+                break;
+            }
+            s.replace(pos, from.size(), to);
+        }
+    }
+}
+
+
+std::string replaceString(const std::string& s, const std::string& from, const std::string& to)
+{
+    std::string r = s;
+    replaceStringInPlace(r, from, to);
+    return r;
+}
+
+
+UNIT_TEST(replaceString)
+{
+    ASSERT_EQ(replaceString("foobar", "foo", "abc"), "abcbar");
+    ASSERT_EQ(replaceString("foobar", "foo", ""), "bar");
+    ASSERT_EQ(replaceString("foobar", "bar", ""), "foo");
+    ASSERT_EQ(replaceString("foobar", "o", ""), "fbar");
+    ASSERT_EQ(replaceString("foofoo", "foo", "foobar"), "foobarfoobar");
+    ASSERT_EQ(replaceString("", "foo", "bar"), "");
+    ASSERT_EQ(replaceString("xx", "x", "xx"), "xxxx");
+}
+
+
+std::string expandUnprintable(const std::string& s, char quotes, char addQuotes)
+{
+    std::string r;
+    char        buf[4];
+
+    if (addQuotes)
+    {
+        r += addQuotes;
+    }
+
+    for (size_t i = 0; i < s.size(); i++)
+    {
+        char c = s[i];
+        if (isprint(c))
+        {
+            if ((c == '\\') || (quotes && (c == quotes)))
+            {
+                // Backslashify backslash and quotes.
+                r += '\\';
+            }
+            r += c;
+        }
+        else
+        {
+            // Unprintable char.
+            r += '\\'; // Leading backslash.
+            switch (c)
+            {
+                // Named control chars.
+            case '\a': r += 'a'; break;
+            case '\b': r += 'b'; break;
+            case '\f': r += 'f'; break;
+            case '\n': r += 'n'; break;
+            case '\r': r += 'r'; break;
+            case '\t': r += 't'; break;
+            case '\v': r += 'v'; break;
+            default:
+                // Hex/octal byte.
+                char next = (i + 1 < s.size()) ? s[i + 1] : 0;
+                if (std::isxdigit(unsigned(next)))
+                {
+                    // Next digit is a valid hex digit:
+                    // Use 3-digit octal variant to limit the length of the numeric escape sequence.
+                    std::snprintf(buf, sizeof(buf), "%03o", uint8_t(c));
+                }
+                else
+                {
+                    // Hex byte.
+                    std::snprintf(buf, sizeof(buf), "x%02x", uint8_t(c));
+                }
+                r += buf;
+                break;
+            }
+        }
+    }
+
+    if (addQuotes)
+    {
+        r += addQuotes;
+    }
+
+    return r;
+}
+
+
+UNIT_TEST(expandUnprintable)
+{
+    ASSERT_EQ(expandUnprintable("abc"), "abc");
+    ASSERT_EQ(expandUnprintable("ab\"c", '"', '"'), "\"ab\\\"c\"");
+    ASSERT_EQ(expandUnprintable("abc\r\n\t   "), "abc\\r\\n\\t   ");
+    ASSERT_EQ(expandUnprintable("\xaa\x61"), "\\252a");
+    ASSERT_EQ(expandUnprintable("\xaa"), "\\xaa");
+    ASSERT_EQ(expandUnprintable(std::string("a\0b", 3)), "a\\000b");
+}
+
+
+std::string compileCString(const std::string& s, std::string* errorMessageOut)
+{
+    std::string r;
+    const char* p = s.c_str();
+    const char* end;
+    char        buf[4];
+
+    if (errorMessageOut)
+    {
+        errorMessageOut->clear();
+    }
+    for (;;)
+    {
+        char c = *(p++);
+        if (c == 0)
+        {
+            break;
+        }
+        if (c == '\\')
+        {
+            // Escape sequence.
+            c = *(p++);
+            switch (c)
+            {
+                // End of string in escape sequence: Emit verbatim backslash.
+            case 0:
+                c = '\\';
+                p--;
+                if (errorMessageOut)
+                {
+                    *errorMessageOut = "unexpected end of string in escape sequence";
+                }
+                break;
+
+                // Named control chars.
+            case 'a': c = '\a'; break;
+            case 'b': c = '\b'; break;
+            case 'f': c = '\f'; break;
+            case 'n': c = '\n'; break;
+            case 'r': c = '\r'; break;
+            case 't': c = '\t'; break;
+            case 'v':
+                c = '\v';
+                break;
+
+                // Hex.
+            case 'x':
+                if (std::isxdigit(unsigned(p[0])))
+                {
+                    c = char(std::strtoul(p, const_cast<char**>(&end), 16));
+                    p = end;
+                }
+                else
+                {
+                    r += '\\';
+                    if (errorMessageOut)
+                    {
+                        *errorMessageOut = "non hex char following \\x";
+                    }
+                }
+                break;
+
+                // Octal.
+            case '0':
+            case '1':
+            case '2':
+            case '3':
+            case '4':
+            case '5':
+            case '6':
+            case '7':
+                // Copy octal number.
+                buf[0] = c;
+                buf[1] = p[0];
+                buf[2] = p[0] ? p[1] : 0;
+                buf[3] = 0;
+                c      = char(std::strtoul(buf, const_cast<char**>(&end), 8));
+                p += end - buf - 1;
+                break;
+
+                // Known backslash sequence: Leave escape sequence intact.
+            default:
+                r += '\\';
+                if (errorMessageOut)
+                {
+                    *errorMessageOut = "unknown backslash sequence '\\" + expandUnprintable(std::string(1, c)) + "'";
+                }
+                break;
+            }
+        }
+        r += c;
+    }
+    return r;
+}
+
+
+UNIT_TEST(compileCString)
+{
+    ASSERT_EQ(compileCString(""), "");
+    ASSERT_EQ(compileCString("abc"), "abc");
+    ASSERT_EQ(compileCString("\\x61\\x62\\x63"), "abc");
+    ASSERT_EQ(compileCString("a\\r\\n\\tb"), "a\r\n\tb");
+    ASSERT_EQ(compileCString("\\x1\\x2\\x3"), "\1\2\3");
+    ASSERT_EQ(compileCString("\\101"), "A");
+    ASSERT_EQ(compileCString("\\x41"), "A");
+    ASSERT_EQ(compileCString("\\x41\\x41\\x41"), "AAA");
+    ASSERT_EQ(compileCString("\\101\\101\\101"), "AAA");
+    ASSERT_EQ(compileCString("\\1112"), "\x49\x32");
+
+    // Errors:
+    std::string err;
+    ASSERT_EQ(compileCString("abc\\", &err), "abc\\");
+    ASSERT_EQ(err, "unexpected end of string in escape sequence");
+    ASSERT_EQ(compileCString("abc\\x", &err), "abc\\x");
+    ASSERT_EQ(err, "non hex char following \\x");
+    ASSERT_EQ(compileCString("abc\\xg", &err), "abc\\xg");
+    ASSERT_EQ(err, "non hex char following \\x");
+    ASSERT_EQ(compileCString("abc\\y", &err), "abc\\y");
+    ASSERT_EQ(err, "unknown backslash sequence '\\y'");
+}
+
+
+std::vector<std::string> splitString(const std::string& s, char sep, int maxSplit)
+{
+    std::vector<std::string> r;
+
+    // Special case: Empty string results in empty list (rather than a list with a single empty string).
+    if (s.empty())
+    {
+        return r;
+    }
+
+    for (size_t start = 0;; maxSplit--)
+    {
+        size_t end = s.find(sep, start);
+        if ((end == std::string::npos) || (maxSplit == 0))
+        {
+            r.push_back(s.substr(start));
+            break;
+        }
+        r.push_back(s.substr(start, end - start));
+        start = end + 1;
+    }
+    return r;
+}
+
+
+UNIT_TEST(splitStringChar)
+{
+    std::vector<std::string> ref;
+    ASSERT_EQ(splitString("", ','), ref);
+    ref = {"abc"};
+    ASSERT_EQ(splitString("abc", ','), ref);
+    ref = {"abc", "foo", "bar"};
+    ASSERT_EQ(splitString("abc,foo,bar", ','), ref);
+    ref = {"abc", "foo", "bar,x,y,z"};
+    ASSERT_EQ(splitString("abc,foo,bar,x,y,z", ',', 2), ref);
+    ref = {"", "", ""};
+    ASSERT_EQ(splitString(",,", ','), ref);
+    ref = {"", "", ""};
+    ASSERT_EQ(splitString(",,", ',', 3), ref);
+    ref = {"", "", ""};
+    ASSERT_EQ(splitString(",,", ',', 2), ref);
+    ref = {"", ","};
+    ASSERT_EQ(splitString(",,", ',', 1), ref);
+    ref = {",,"};
+    ASSERT_EQ(splitString(",,", ',', 0), ref);
+    ref = {"", ""};
+    ASSERT_EQ(splitString(",", ','), ref);
+    ref = {"abc", "def", ""};
+    ASSERT_EQ(splitString("abc,def,", ','), ref);
+    ref = {"", "abc", "def"};
+    ASSERT_EQ(splitString(",abc,def", ','), ref);
+}
+
+
+std::vector<std::string> splitString(const std::string& s, const std::string& sep, int maxSplit)
+{
+    std::vector<std::string> r;
+
+    // Special case: Empty string results in empty list (rather than a list with a single empty string).
+    if (s.empty())
+    {
+        return r;
+    }
+
+    for (size_t start = 0;; maxSplit--)
+    {
+        size_t end = s.find(sep, start);
+        if ((end == std::string::npos) || (maxSplit == 0))
+        {
+            r.push_back(s.substr(start));
+            break;
+        }
+        r.push_back(s.substr(start, end - start));
+        start = end + sep.length();
+    }
+    return r;
+}
+
+
+UNIT_TEST(splitStringStr)
+{
+    std::vector<std::string> ref;
+    ASSERT_EQ(splitString("", "==="), ref);
+    ref = {"abc"};
+    ASSERT_EQ(splitString("abc", "==="), ref);
+    ref = {"a=c", "foo", "bar"};
+    ASSERT_EQ(splitString("a=c===foo===bar", "==="), ref);
+    ref = {"abc", "foo", "bar===x===y===z"};
+    ASSERT_EQ(splitString("abc===foo===bar===x===y===z", "===", 2), ref);
+    ref = {"", "", ""};
+    ASSERT_EQ(splitString("==>==>", "==>"), ref);
+    ref = {"", "", ""};
+    ASSERT_EQ(splitString("==>==>", "==>", 3), ref);
+    ref = {"", "", ""};
+    ASSERT_EQ(splitString("==>==>", "==>", 2), ref);
+    ref = {"", "==>"};
+    ASSERT_EQ(splitString("==>==>", "==>", 1), ref);
+    ref = {"==>==>"};
+    ASSERT_EQ(splitString("==>==>", "==>", 0), ref);
+    ref = {"", ""};
+    ASSERT_EQ(splitString("===", "==="), ref);
+    ref = {"abc", "def", ""};
+    ASSERT_EQ(splitString("abc===def===", "==="), ref);
+    ref = {"", "abc", "def"};
+    ASSERT_EQ(splitString("===abc===def", "==="), ref);
+}
+
+
+std::vector<std::string> splitLines(const std::string& s, size_t wrapCol)
+{
+    std::vector<std::string> r;
+    size_t                   start    = 0;
+    size_t                   pos      = 0;
+    size_t                   splitPos = 0;
+    size_t                   col      = 0;
+    std::string              indent;
+    bool                     firstPart = true; // First subline of a wrapped line.
+    while (pos < s.length())
+    {
+        if (s[pos] == '\n')
+        {
+            std::string line = s.substr(start, pos - start);
+            r.push_back(indent + line);
+            pos++;
+            start     = pos;
+            splitPos  = pos;
+            col       = 0;
+            indent    = "";
+            firstPart = true;
+            continue;
+        }
+        if (std::isspace(unsigned(s[pos])))
+        {
+            splitPos = pos + 1;
+        }
+        if ((wrapCol > 0) && (col == wrapCol))
+        {
+            if (splitPos == start)
+            {
+                splitPos = pos;
+            }
+            std::string line = s.substr(start, splitPos - start);
+            r.push_back(indent + line);
+            pos   = splitPos;
+            start = pos;
+            col   = indent.length();
+            if (firstPart)
+            {
+                firstPart = false;
+                size_t i  = 0;
+                while ((i < line.size()) && ((line[i] == ' ') || (line[i] == '-')))
+                {
+                    i++;
+                    indent += ' ';
+                }
+            }
+            continue;
+        }
+        pos++;
+        col++;
+    }
+    if (start < s.length())
+    {
+        r.push_back(s.substr(start, s.length() - start));
+    }
+    return r;
+}
+
+
+UNIT_TEST(splitLines)
+{
+    std::vector<std::string> ref;
+    ASSERT_EQ(splitLines(""), ref);
+    ref = {"a"};
+    ASSERT_EQ(splitLines("a"), ref);
+    ASSERT_EQ(splitLines("a\n"), ref);
+    ref = {"a", ""};
+    ASSERT_EQ(splitLines("a\n\n"), ref);
+}
+
+
+std::string joinStrings(const std::vector<std::string>& stringList, const std::string& sep)
+{
+    std::ostringstream r;
+    if (!stringList.empty())
+    {
+        r << stringList[0];
+        for (size_t i = 1; i < stringList.size(); i++)
+        {
+            r << sep << stringList[i];
+        }
+    }
+    return std::move(r).str();
+}
+
+
+UNIT_TEST(joinStrings)
+{
+    ASSERT_EQ(joinStrings({"a", "b", "c"}, ","), "a,b,c");
+    ASSERT_EQ(joinStrings({"a", "b"}, ","), "a,b");
+    ASSERT_EQ(joinStrings({"a"}, ","), "a");
+    ASSERT_EQ(joinStrings({}, ","), "");
+    ASSERT_EQ(joinStrings({"", "", ""}, ","), ",,");
+}
+
+
+UNIT_TEST(regex_replace)
+{
+    ASSERT_EQ(regex_replace("aa XX bb YY cc", std::regex("[A-Z]+"), [&](const std::smatch& match)
+                  { return "(" + match[0].str() + ")"; }),
+        "aa (XX) bb (YY) cc");
+    ASSERT_EQ(regex_replace("XX bb YY cc", std::regex("[A-Z]+"), [&](const std::smatch& match)
+                  { return "(" + match[0].str() + ")"; }),
+        "(XX) bb (YY) cc");
+    ASSERT_EQ(regex_replace("aa XX bb YY", std::regex("[A-Z]+"), [&](const std::smatch& match)
+                  { return "(" + match[0].str() + ")"; }),
+        "aa (XX) bb (YY)");
+    ASSERT_EQ(regex_replace("aa", std::regex("bb"), [&](const std::smatch& match)
+                  { return match[0].str(); }),
+        "aa");
+    ASSERT_EQ(regex_replace("", std::regex("bb"), [&](const std::smatch& match)
+                  { return match[0].str(); }),
+        "");
+    ASSERT_EQ(regex_replace("aa", std::regex("aa"), [&](const std::smatch& match)
+                  { return match[0].str(); }),
+        "aa");
+    ASSERT_EQ(regex_replace("aa XX bb YY cc", std::regex("[A-Z]+"), [&](const std::smatch& match)
+                  { return tolower(match[0].str()); }),
+        "aa xx bb yy cc");
+    ASSERT_EQ(regex_replace("aa XX bb YY cc", std::regex("[A-Z]+"), [&](const std::smatch& match)
+                  { return match.format("f($&)"); }),
+        "aa f(XX) bb f(YY) cc");
+    ASSERT_EQ(regex_replace("aa XX.jpg bb YY.jpg cc", std::regex("([A-Z]+)[.]jpg"), [&](const std::smatch& match)
+                  { return match.format("pic_$1.png"); }),
+        "aa pic_XX.png bb pic_YY.png cc");
+}
+
+
+void skipSpace(const char*& s) noexcept
+{
+    if (s)
+    {
+        while (std::isspace(uint8_t(*s)))
+        {
+            s++;
+        }
+    }
+}
+
+
+UNIT_TEST(skipSpace)
+{
+    const char* p = " \t\n\ra \t";
+    skipSpace(p);
+    ASSERT_EQ(*p, 'a');
+}
+
+
+std::string tolower(std::string s)
+{
+    std::transform(s.begin(), s.end(), s.begin(), [](char c)
+        { return tolower(c); });
+    return s;
+}
+
+
+UNIT_TEST(tolower_char)
+{
+    ASSERT_EQ(tolower('A'), 'a');
+    ASSERT_EQ(tolower('\xc1'), '\xc1');
+}
+
+
+UNIT_TEST(tolower_string)
+{
+    ASSERT_EQ(tolower("ABC"), "abc");
+    ASSERT_EQ(tolower("\xff\x80 C"), "\xff\x80 c");
+    ASSERT_EQ(tolower(""), "");
+}
+
+
+std::string toupper(std::string s)
+{
+    std::transform(s.begin(), s.end(), s.begin(), [](char c)
+        { return toupper(c); });
+    return s;
+}
+
+
+UNIT_TEST(toupper_char)
+{
+    ASSERT_EQ(toupper('a'), 'A');
+    ASSERT_EQ(toupper('\xc1'), '\xc1');
+}
+
+
+UNIT_TEST(toupper_string)
+{
+    ASSERT_EQ(toupper("abc"), "ABC");
+    ASSERT_EQ(toupper("\xff\x80 c"), "\xff\x80 C");
+    ASSERT_EQ(toupper(""), "");
+}
+
+
+std::string capitalize(std::string s)
+{
+    s = tolower(s);
+    if (!s.empty())
+    {
+        s[0] = char(std::toupper(unsigned(s[0])));
+    }
+    return s;
+}
+
+
+UNIT_TEST(capitalize)
+{
+    ASSERT_EQ(capitalize("abc"), "Abc");
+    ASSERT_EQ(capitalize("ABC"), "Abc");
+    ASSERT_EQ(capitalize("a"), "A");
+    ASSERT_EQ(capitalize("\xff\x80 c"), "\xff\x80 c");
+    ASSERT_EQ(capitalize(""), "");
+    ASSERT_EQ(capitalize(" abc"), " abc");
+    ASSERT_EQ(capitalize("one two"), "One two");
+}
+
+
+UNIT_TEST(isalnum_)
+{
+    ASSERT_EQ(isalnum_('_'), true);
+    ASSERT_EQ(isalnum_('a'), true);
+    ASSERT_EQ(isalnum_('0'), true);
+    ASSERT_EQ(isalnum_(' '), false);
+}
+
+
+void addTrailingLfIfMissing(std::string& s)
+{
+    if (s.empty() || (s.back() != '\n'))
+    {
+        s.append("\n");
+    }
+}
+
+
+UNIT_TEST(addTrailingLfIfMissing)
+{
+    std::string s("abc");
+    addTrailingLfIfMissing(s);
+    ASSERT_EQ(s, "abc\n");
+    s = "abc\n";
+    addTrailingLfIfMissing(s);
+    ASSERT_EQ(s, "abc\n");
+    s = "";
+    addTrailingLfIfMissing(s);
+    ASSERT_EQ(s, "\n");
+    s = "\n";
+    addTrailingLfIfMissing(s);
+    ASSERT_EQ(s, "\n");
+}
+
+
+std::string quoteRegexChars(const std::string& s)
+{
+    std::string       r;
+    const std::string special = "[](){}^$.*+|?\\";
+    for (char c: s)
+    {
+        if (special.find(c) != std::string::npos)
+        {
+            r += '\\';
+        }
+        r += c;
+    }
+    return r;
+}
+
+
+UNIT_TEST(quoteRegexChars)
+{
+    std::string r = "^[F][O][O]a.a*a+a|a?a{}a()a?\\$";
+    ASSERT_EQ(ut1::regex_replace("A" + r + "B", std::regex(quoteRegexChars(r)), [&](const std::smatch&)
+                  { return "X"; }),
+        "AXB");
+}
+
+
+std::string toNfd(const std::string& s)
+{
+    // This only works for german umlauts so far.
+    std::string r;
+    for (size_t i = 0; i < s.length(); i++)
+    {
+        if ((s[i] == '\xc3') && (i < s.length() - 1))
+        {
+            switch (s[i + 1])
+            {
+            case '\x84': r += "A\xcc\x88"; i++; continue;
+            case '\x96': r += "O\xcc\x88"; i++; continue;
+            case '\x9c': r += "U\xcc\x88"; i++; continue;
+            case '\xa4': r += "a\xcc\x88"; i++; continue;
+            case '\xb6': r += "o\xcc\x88"; i++; continue;
+            case '\xbc': r += "u\xcc\x88"; i++; continue;
+            default: break;
+            }
+        }
+        r += s[i];
+    }
+    return r;
+}
+
+
+UNIT_TEST(toNfd)
+{
+    ASSERT_EQ(ut1::toNfd(""), "");
+    ASSERT_EQ(ut1::toNfd("\xcc\x88"), "\xcc\x88");
+    ASSERT_EQ(ut1::toNfd("A\xcc\x88"), "A\xcc\x88");
+    ASSERT_EQ(ut1::toNfd("\xc3\x84"), "A\xcc\x88");
+}
+
+uint64_t strToU64(const std::string& s)
+{
+    static constexpr std::string_view supportedSuffixes = "k, M, G, T, P, E";
+    size_t pos = 0;
+    uint64_t r = std::stoull(s, &pos, 0);
+    if (pos < s.length())
+    {
+        if (pos != s.length() - 1)
+        {
+            throw std::runtime_error(std::format("Syntax error in integer (suffix too long)! Supported suffixes: {} (case-insensitive).", supportedSuffixes));
+        }
+        switch (s[pos])
+        {
+            case 'K':
+            case 'k': r <<= 10; break;
+            case 'm':
+            case 'M': r <<= 20; break;
+            case 'g':
+            case 'G': r <<= 30; break;
+            case 't':
+            case 'T': r <<= 40; break;
+            case 'p':
+            case 'P': r <<= 50; break;
+            case 'e':
+            case 'E': r <<= 60; break;
+            default:
+                throw std::runtime_error(std::format("Syntax error in integer (unknown unit)! Supported suffixes: {} (case-insensitive).", supportedSuffixes));
+        }
+    }
+    return r;
+}
+
+UNIT_TEST(strToU64)
+{
+    ASSERT_EQ(ut1::strToU64("0"), 0ull);
+    ASSERT_EQ(ut1::strToU64("42"), 42ull);
+    ASSERT_EQ(ut1::strToU64("4k"), 4096ull);
+    ASSERT_EQ(ut1::strToU64("4K"), 4096ull);
+    ASSERT_EQ(ut1::strToU64("2m"), 2*1024*1024ull);
+    ASSERT_EQ(ut1::strToU64("2M"), 2*1024*1024ull);
+    ASSERT_EQ(ut1::strToU64("3g"), 3ull*1024*1024*1024);
+    ASSERT_EQ(ut1::strToU64("3G"), 3ull*1024*1024*1024);
+}
+
+std::string formatU64WithUnderscores(uint64_t value)
+{
+    std::string digits = std::to_string(value);
+    std::string out;
+    out.reserve(digits.size() + digits.size() / 3);
+    for (size_t i = 0; i < digits.size(); i++)
+    {
+        if (i > 0 && (digits.size() - i) % 3 == 0)
+        {
+            out.push_back('_');
+        }
+        out.push_back(digits[i]);
+    }
+    return out;
+}
+
+UNIT_TEST(formatU64WithUnderscores)
+{
+    ASSERT_EQ(ut1::formatU64WithUnderscores(0), "0");
+    ASSERT_EQ(ut1::formatU64WithUnderscores(12), "12");
+    ASSERT_EQ(ut1::formatU64WithUnderscores(123), "123");
+    ASSERT_EQ(ut1::formatU64WithUnderscores(1234), "1_234");
+    ASSERT_EQ(ut1::formatU64WithUnderscores(1234567890), "1_234_567_890");
+    ASSERT_EQ(ut1::formatU64WithUnderscores(18446744073709551615ull), "18_446_744_073_709_551_615");
+}
+
+UNIT_TEST(csvIntegersToVector)
+{
+    ASSERT_EQ(ut1::csvIntegersToVector<uint8_t>(""), std::vector<uint8_t>({}));
+    ASSERT_EQ(ut1::csvIntegersToVector<uint8_t>("  42  "), std::vector<uint8_t>({42}));
+    ASSERT_EQ(ut1::csvIntegersToVector<uint8_t>("0,1,2,3"), std::vector<uint8_t>({0, 1, 2, 3}));
+    ASSERT_EQ(ut1::csvIntegersToVector<uint16_t>("0,1,2,0x10"), std::vector<uint16_t>({0, 1, 2, 16}));
+    ASSERT_EQ(ut1::csvIntegersToVector<uint16_t>("0,1, 2 ,0x10"), std::vector<uint16_t>({0, 1, 2, 16}));
+    ASSERT_EQ(ut1::csvIntegersToVector<uint16_t>("00,ff,aa,55", 16), std::vector<uint16_t>({0, 0xff, 0xaa, 0x55}));
+}
+
+std::ostream& operator<<(std::ostream& s, const std::vector<std::string>& v)
+{
+    s << "{";
+    bool first = true;
+    for (const auto& elem: v)
+    {
+        if (!first)
+        {
+            s << ", ";
+        }
+        else
+        {
+            first = false;
+        }
+        s << expandUnprintable(elem, '"', '"');
+    }
+    s << "}";
+    return s;
+}
+
+
+std::ostream& flushTty(std::ostream& os)
+{
+    static const bool stdoutIsATty = bool(isatty(1));
+
+    // Do not flush stdout if os is not stdout.
+    if (os.rdbuf() != std::cout.rdbuf())
+    {
+        return os;
+    }
+
+    // Flush stdout only if it is connected to a terminal.
+    if (stdoutIsATty)
+    {
+        os << std::flush;
+    }
+
+    return os;
+}
+
+
+std::string secondsToString(double seconds)
+{
+    std::string r;
+    if (seconds < 0.0)
+    {
+        r = "-";
+        seconds = -seconds;
+    }
+    if (seconds < 99.5)
+    {
+        return std::format("{:.1f}s", seconds);
+    }
+    else if (seconds < 99.5 * 60.0)
+    {
+        return std::format("{:.1f}m", seconds / 60.0);
+    }
+    else if (seconds < 99.5 * 60.0 * 60.0)
+    {
+        return std::format("{:.1f}h", seconds / 60.0 / 60.0);
+    }
+    else
+    {
+        return std::format("{:.1f}d", seconds / 60.0 / 60.0 / 24.0);
+    }
+}
+
+
+std::string getPreciseSizeStr(size_t size, uint64_t* factor)
+{
+    static constexpr std::array sizeStr{"bytes", "kB", "MB", "GB", "TB", "PB", "EB"};
+    size_t sizeStrIndex = 0;
+    uint64_t unitFactor = 1;
+    if (size == 1)
+    {
+        if (factor != nullptr)
+        {
+            *factor = 1;
+        }
+        return "1 byte";
+    }
+    while (size >= 1024)
+    {
+        size >>= 10;
+        unitFactor <<= 10;
+        sizeStrIndex++;
+    }
+    if (factor != nullptr)
+    {
+        *factor = unitFactor;
+    }
+    return std::format("{} {}", size, sizeStr[sizeStrIndex]);
+}
+
+std::string getApproxSizeStr(double bytes, unsigned precision, bool space, bool bytesWithPrecision, bool shortBytes)
+{
+    static constexpr std::array sizeStr{"bytes", "kB", "MB", "GB", "TB", "PB", "EB"};
+    if (bytes <= 0.0)
+    {
+        bytes = 0;
+    }
+    double value = bytes;
+    size_t sizeStrIndex = 0;
+    uint64_t whole = static_cast<uint64_t>(bytes);
+    while (whole >= 1024 && sizeStrIndex + 1 < std::size(sizeStr))
+    {
+        whole >>= 10;
+        value /= 1024.0;
+        sizeStrIndex++;
+    }
+
+    std::ostringstream os;
+    if (sizeStrIndex == 0 && !bytesWithPrecision)
+    {
+        os << static_cast<uint64_t>(bytes);
+    }
+    else
+    {
+        os << std::fixed << std::setprecision(precision) << value;
+    }
+    if (space)
+    {
+        os << " ";
+    }
+    if (shortBytes && sizeStrIndex == 0)
+    {
+        os << "B";
+    }
+    else
+    {
+        os << sizeStr[sizeStrIndex];
+    }
+    return std::move(os).str();
+}
+
+std::string getApproxSizeStr(uint64_t bytes, unsigned precision, bool space, bool bytesWithPrecision, bool shortBytes)
+{
+    return getApproxSizeStr(static_cast<double>(bytes), precision, space, bytesWithPrecision, shortBytes);
+}
+
+
+UNIT_TEST(getPreciseSizeStr)
+{
+    ASSERT_EQ(getPreciseSizeStr(0), "0 bytes");
+    ASSERT_EQ(getPreciseSizeStr(1), "1 byte");
+    ASSERT_EQ(getPreciseSizeStr(2), "2 bytes");
+    ASSERT_EQ(getPreciseSizeStr(7*1024), "7 kB");
+    ASSERT_EQ(getPreciseSizeStr(7*1024*1024), "7 MB");
+    ASSERT_EQ(getPreciseSizeStr(7ull*1024*1024*1024), "7 GB");
+    ASSERT_EQ(getPreciseSizeStr(7ull*1024*1024*1024*1024), "7 TB");
+
+    uint64_t factor = 0;
+    ASSERT_EQ(getPreciseSizeStr(0, &factor), "0 bytes");
+    ASSERT_EQ(factor, 1ULL);
+    ASSERT_EQ(getPreciseSizeStr(1024, &factor), "1 kB");
+    ASSERT_EQ(factor, 1024ULL);
+    ASSERT_EQ(getPreciseSizeStr(1024 * 1024, &factor), "1 MB");
+    ASSERT_EQ(factor, 1024ULL * 1024ULL);
+}
+
+
+size_t getLargestPowerOfTwoFactor(size_t size)
+{
+    if (size == 0)
+    {
+        return 0;
+    }
+    size_t bSize = 1;
+    while ((size & 1) == 0)
+    {
+        size >>= 1;
+        bSize <<= 1;
+    }
+    return bSize;
+}
+
+
+UNIT_TEST(getLargestPowerOfTwoFactor)
+{
+    ASSERT_EQ(getLargestPowerOfTwoFactor(0), 0);
+    ASSERT_EQ(getLargestPowerOfTwoFactor(1), 1);
+    ASSERT_EQ(getLargestPowerOfTwoFactor(2), 2);
+    ASSERT_EQ(getLargestPowerOfTwoFactor(3), 1);
+    ASSERT_EQ(getLargestPowerOfTwoFactor(4), 4);
+    ASSERT_EQ(getLargestPowerOfTwoFactor(5), 1);
+    ASSERT_EQ(getLargestPowerOfTwoFactor(6), 2);
+    ASSERT_EQ(getLargestPowerOfTwoFactor(7), 1);
+    ASSERT_EQ(getLargestPowerOfTwoFactor(8), 8);
+    ASSERT_EQ(getLargestPowerOfTwoFactor(9), 1);
+    ASSERT_EQ(getLargestPowerOfTwoFactor(7*1024), 1024);
+    ASSERT_EQ(getLargestPowerOfTwoFactor(7*1024*1024), 1024*1024);
+}
+
+
+std::string readFile(const std::string& filename)
+{
+    std::ifstream is(filename, std::ios::in | std::ios::binary | std::ios::ate);
+    if (!is)
+    {
+        throw std::runtime_error(std::format("readFile({}): Error while opening file for reading.", filename));
+    }
+    std::ifstream::pos_type endPos = is.tellg();
+    if (endPos < 0)
+    {
+        throw std::runtime_error(std::format("readFile({}): Error while determining file size.", filename));
+    }
+    size_t size = static_cast<size_t>(endPos);
+    is.seekg(0, is.beg);
+    if (!is)
+    {
+        throw std::runtime_error(std::format("readFile({}): Error while seeking file.", filename));
+    }
+    std::string r(size, '\0');
+    if (size != 0)
+    {
+        is.read(&r[0], size);
+    }
+    if (!is)
+    {
+        throw std::runtime_error(std::format("readFile({}): Error while reading file.", filename));
+    }
+    return r;
+}
+
+
+void writeFile(const std::string& filename, const std::string& data)
+{
+    std::ofstream os(filename, std::ios::out | std::ios::binary | std::ios::trunc);
+    if (!os)
+    {
+        throw std::runtime_error(std::format("writeFile({}): Error while opening file for writing.", filename));
+    }
+    os.write(data.data(), data.size());
+    if (!os)
+    {
+        throw std::runtime_error(std::format("writeFile({}): Error while writing file.", filename));
+    }
+    os.close();
+    if (!os)
+    {
+        throw std::runtime_error(std::format("writeFile({}): Error while closing file.", filename));
+    }
+}
+
+UNIT_TEST(readFile_writeFile)
+{
+    std::string filename = "MiscUtilsTmp";
+    writeFile(filename, "abc");
+    std::string s = readFile(filename);
+    ASSERT_EQ(s, "abc");
+    std::filesystem::remove(filename);
+}
+
+size_t getFileSize(const std::string& filename)
+{
+    int fd = ::open(filename.c_str(), O_RDONLY);
+    if (fd == -1)
+    {
+        throw std::runtime_error(std::format("getFileSize({}): Error while opening file for reading.", filename));
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) == -1)
+    {
+        ::close(fd);
+        throw std::runtime_error(std::format("getFileSize({}): Error while fstat()ing file.", filename));
+    }
+
+    size_t size = 0;
+
+    if (S_ISREG(st.st_mode)) // Regular file.
+    {
+        size = size_t(st.st_size);
+    }
+    else if (S_ISBLK(st.st_mode) || S_ISCHR(st.st_mode)) // Block or character device (e.g., /dev/disk16).
+    {
+#if defined(__linux__)
+        uint64_t deviceSize = 0;
+        if (::ioctl(fd, BLKGETSIZE64, &deviceSize) == -1)
+        {
+            const std::string error = std::strerror(errno);
+            ::close(fd);
+            throw std::runtime_error(std::format("getFileSize({}): ioctl BLKGETSIZE64 failed: {}.", filename, error));
+        }
+        size = size_t(deviceSize);
+#elif defined(__APPLE__)
+        uint64_t blockCount = 0;
+        uint32_t blockSize = 0;
+
+        if (::ioctl(fd, DKIOCGETBLOCKCOUNT, &blockCount) == -1)
+        {
+            ::close(fd);
+            throw std::runtime_error(std::format("getFileSize({}): ioctl DKIOCGETBLOCKCOUNT failed.", filename));
+        }
+
+        if (ioctl(fd, DKIOCGETBLOCKSIZE, &blockSize) == -1) {
+            ::close(fd);
+            throw std::runtime_error(std::format("getFileSize({}): ioctl DKIOCGETBLOCKSIZE failed.", filename));
+        }
+
+        size = size_t(blockCount * blockSize);
+#else
+        size = size_t(st.st_size);
+#endif
+    }
+    else
+    {
+        ::close(fd);
+        throw std::runtime_error(std::format("getFileSize({}): Unknown file type.", filename));
+    }
+
+    ::close(fd);
+    return size;
+}
+
+FileType getFileType(const std::filesystem::directory_entry& entry, bool followSymlinks)
+{
+    // First check for symlink.
+    // is_symlink() never follows symlinks, while all other is_*() functions follow symlinks.
+    if (entry.is_symlink())
+    {
+        // Report broken symlinks as symlink, even  when when following symlinks.
+        if ((!followSymlinks) || (!entry.exists()))
+        {
+            return FileType::SYMLINK;
+        }
+    }
+    if (entry.is_regular_file())
+    {
+        return FileType::REGULAR;
+    }
+    else if (entry.is_directory())
+    {
+        return FileType::DIR;
+    }
+    else if (entry.is_fifo())
+    {
+        return FileType::FIFO;
+    }
+    else if (entry.is_block_file())
+    {
+        return FileType::BLOCK;
+    }
+    else if (entry.is_character_file())
+    {
+        return FileType::CHAR;
+    }
+    else if (entry.is_socket())
+    {
+        return FileType::SOCKET;
+    }
+    else
+    {
+        return FileType::NON_EXISTING;
+    }
+}
+
+FileType getFileType(const std::filesystem::path& entry, bool followSymlinks)
+{
+    // First check for symlink.
+    // is_symlink() never follows symlinks, while all other is_*() functions follow symlinks.
+    if (std::filesystem::is_symlink(entry))
+    {
+        // Report broken symlinks as symlink, even when following symlinks.
+        if ((!followSymlinks) || (!std::filesystem::exists(entry)))
+        {
+            return FileType::SYMLINK;
+        }
+    }
+    if (std::filesystem::is_regular_file(entry))
+    {
+        return FileType::REGULAR;
+    }
+    else if (std::filesystem::is_directory(entry))
+    {
+        return FileType::DIR;
+    }
+    else if (std::filesystem::is_fifo(entry))
+    {
+        return FileType::FIFO;
+    }
+    else if (std::filesystem::is_block_file(entry))
+    {
+        return FileType::BLOCK;
+    }
+    else if (std::filesystem::is_character_file(entry))
+    {
+        return FileType::CHAR;
+    }
+    else if (std::filesystem::is_socket(entry))
+    {
+        return FileType::SOCKET;
+    }
+    else
+    {
+        return FileType::NON_EXISTING;
+    }
+}
+
+std::string getFileTypeStr(const std::filesystem::directory_entry& entry, bool followSymlinks)
+{
+    return getFileTypeStr(getFileType(entry, followSymlinks));
+}
+
+std::string getFileTypeStr(const std::filesystem::path& entry, bool followSymlinks)
+{
+    return getFileTypeStr(getFileType(entry, followSymlinks));
+}
+
+std::string getFileTypeStr(FileType fileType)
+{
+    switch (fileType)
+    {
+    using enum FileType;
+    case REGULAR: return "file";
+    case DIR: return "dir";
+    case SYMLINK: return "symlink";
+    case FIFO: return "fifo";
+    case BLOCK: return "block-device";
+    case CHAR: return "char-device";
+    case SOCKET: return "socket";
+    case NON_EXISTING: return "non-existing";
+    default: return "unknown-file-type";
+    }
+}
+
+bool fsExists(const std::filesystem::path& entry)
+{
+    return std::filesystem::exists(entry) || std::filesystem::is_symlink(entry);
+}
+
+bool fsIsDirectory(const std::filesystem::path& entry, bool followSymlinks)
+{
+    return getFileType(entry, followSymlinks) == FileType::DIR;
+}
+
+bool fsIsRegular(const std::filesystem::path& entry, bool followSymlinks)
+{
+    return getFileType(entry, followSymlinks) == FileType::REGULAR;
+}
+
+StatInfo::StatInfo()
+{
+    statData = {};
+}
+
+StatInfo::StatInfo(const std::filesystem::directory_entry& entry, bool followSymlinks)
+{
+    if (followSymlinks)
+    {
+        stat(entry.path().c_str(), &statData);
+    }
+    else
+    {
+        lstat(entry.path().c_str(), &statData);
+    }
+}
+
+std::filesystem::file_time_type StatInfo::getMTime() const
+{
+    using fs_seconds = std::chrono::duration<std::filesystem::file_time_type::rep>;
+    using fs_nanoseconds = std::chrono::duration<std::filesystem::file_time_type::rep, std::nano>;
+    auto dur = fs_seconds(getMTimeSpec().tv_sec) + fs_nanoseconds(getMTimeSpec().tv_nsec);
+    return std::filesystem::file_time_type(dur);
+}
+
+StatInfo getStat(const std::filesystem::directory_entry& entry, bool followSymlinks)
+{
+    return StatInfo(entry, followSymlinks);
+}
+
+std::filesystem::file_time_type getLastWriteTime(const std::filesystem::directory_entry& entry, bool followSymlinks)
+{
+    return getStat(entry, followSymlinks).getMTime();
+}
+
+void setLastWriteTime(const std::filesystem::directory_entry& entry, std::filesystem::file_time_type newTime, bool followSymlinks)
+{
+    auto sec = std::chrono::time_point_cast<std::chrono::seconds>(newTime);
+    auto nsec = std::chrono::time_point_cast<std::chrono::nanoseconds>(newTime) - std::chrono::time_point_cast<std::chrono::nanoseconds>(sec);
+
+    struct timespec t[2];
+    t[0].tv_sec = 0;
+    t[0].tv_nsec = UTIME_OMIT;
+    t[1].tv_sec = sec.time_since_epoch().count();
+    t[1].tv_nsec = nsec.count();
+
+    utimensat(AT_FDCWD, entry.path().c_str(), t, followSymlinks ? 0 : AT_SYMLINK_NOFOLLOW);
+}
+
+
+} // namespace ut1
