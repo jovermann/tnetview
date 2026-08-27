@@ -1416,9 +1416,7 @@ int main(int argc, char* argv[])
 try
 {
     ut1::CommandLineParser cl("tnetview", "Usage: tnetview [options]\n\nColorful terminal network status monitor.",
-        "\nKeys: 1 status, 2 local devices, 3 known devices, 4 interfaces, 5 prerequisites.\n"
-        "      Up/Down or j/k select, Space toggles known, n renames, d deletes.\n"
-        "      r refresh, t show colors, q quit.\n",
+        "\n$programName version $version ($compileDate) *** Copyright (c) 2026 Johannes Overmann *** https://github.com/jovermann/tnetview",
         Version);
     cl.addOption('t', "timeout", "Connection timeout in milliseconds.", "MS", "1000");
     cl.addOption(0, "retries", "Number of ICMP ping attempts.", "COUNT", "5");
