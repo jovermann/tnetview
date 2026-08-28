@@ -143,6 +143,14 @@ int readKey(int timeoutMs)
     {
         return keyDown;
     }
+    if ((third == '5') || (third == '6'))
+    {
+        int fourth = readStdinByte(20);
+        if (fourth == '~')
+        {
+            return third == '5' ? keyPageUp : keyPageDown;
+        }
+    }
     return 27;
 }
 
@@ -161,7 +169,7 @@ void leaveAlternateScreen()
     std::cout << "\033[?1049l\033[?25h" << std::flush;
 }
 
-void printAnsiColorMatrix(std::ostream& os, size_t maxRows)
+void printAnsiColorMatrix(std::ostream& os, size_t maxRows, size_t maxWidth)
 {
     const std::vector<int> foregrounds = {30, 31, 32, 33, 34, 35, 36, 37, 90, 91, 92, 93, 94, 95, 96, 97};
     const std::vector<int> backgrounds = {40, 41, 42, 43, 44, 45, 46, 47, 100, 101, 102, 103, 104, 105, 106, 107};
@@ -173,10 +181,16 @@ void printAnsiColorMatrix(std::ostream& os, size_t maxRows)
             break;
         }
         os << ansiGray << "bg " << bg << " " << ansiReset;
+        size_t printedWidth = std::string("bg ").size() + std::to_string(bg).size() + 1;
         for (int fg : foregrounds)
         {
+            if (maxWidth && printedWidth + 8 > maxWidth)
+            {
+                break;
+            }
             std::string cell = std::to_string(bg) + ";" + std::to_string(fg);
             os << "\033[" << bg << ";" << fg << "m" << std::setw(8) << cell << ansiReset;
+            printedWidth += 8;
         }
         os << "\n";
         printedRows++;

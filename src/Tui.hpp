@@ -88,8 +88,10 @@ int readStdinByte(int timeoutMs = -1);
 /// Decoded special-key values returned by readKey().
 constexpr int keyUp   = 0x100;
 constexpr int keyDown = 0x101;
+constexpr int keyPageUp = 0x102;
+constexpr int keyPageDown = 0x103;
 
-/// Read a key and decode common ANSI cursor-up/down sequences.
+/// Read a key and decode common ANSI cursor and page-key sequences.
 int readKey(int timeoutMs = -1);
 
 /// Clear the terminal and move the cursor to the upper-left corner.
@@ -103,7 +105,8 @@ void leaveAlternateScreen();
 ///
 /// Each cell is rendered with the color combination it names, e.g. "41;37".
 /// maxRows limits output for small terminals; set it to 0 to print no rows.
-void printAnsiColorMatrix(std::ostream& os, size_t maxRows);
+/// maxWidth limits columns to avoid terminal wrapping; zero means unlimited.
+void printAnsiColorMatrix(std::ostream& os, size_t maxRows, size_t maxWidth = 0);
 
 }
 }
