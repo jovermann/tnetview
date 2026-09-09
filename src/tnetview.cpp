@@ -11,6 +11,7 @@
 #include <arpa/inet.h>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -43,6 +44,9 @@ using Clock = std::chrono::steady_clock;
 
 /// Program version reported by --version.
 static constexpr const char* Version = "0.1.0";
+
+/// Path used to invoke the program, for finding data beside the executable.
+static std::string programPath;
 
 /// Result of one network status check.
 struct Result
@@ -204,6 +208,62 @@ static std::string commandOutput(const char* command)
     return out;
 }
 
+/// Run a utility without a shell and collect output until a strict deadline.
+static std::string commandOutput(const std::vector<std::string>& arguments, int timeoutMs = 1500)
+{
+    if (arguments.empty())
+        return {};
+    int descriptors[2];
+    if (pipe(descriptors) != 0)
+        return {};
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addclose(&actions, descriptors[0]);
+    posix_spawn_file_actions_adddup2(&actions, descriptors[1], STDOUT_FILENO);
+    posix_spawn_file_actions_addclose(&actions, descriptors[1]);
+    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+    std::vector<char*> argv;
+    for (const auto& argument: arguments)
+        argv.push_back(const_cast<char*>(argument.c_str()));
+    argv.push_back(nullptr);
+    pid_t pid {};
+    int created = posix_spawnp(&pid, argv[0], &actions, nullptr, argv.data(), environ);
+    posix_spawn_file_actions_destroy(&actions);
+    close(descriptors[1]);
+    if (created != 0)
+    {
+        close(descriptors[0]);
+        return {};
+    }
+    fcntl(descriptors[0], F_SETFL, fcntl(descriptors[0], F_GETFL) | O_NONBLOCK);
+    std::string output;
+    int         status {};
+    bool        finished = false;
+    auto        deadline = Clock::now() + std::chrono::milliseconds(timeoutMs);
+    while (!finished && Clock::now() < deadline)
+    {
+        char buffer[512];
+        for (ssize_t n; (n = read(descriptors[0], buffer, sizeof(buffer))) > 0;)
+            output.append(buffer, static_cast<size_t>(n));
+        auto result = waitpid(pid, &status, WNOHANG);
+        finished    = result == pid || (result < 0 && errno != EINTR);
+        if (!finished)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (!finished)
+    {
+        kill(pid, SIGKILL);
+        while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+        {
+        }
+    }
+    char buffer[512];
+    for (ssize_t n; (n = read(descriptors[0], buffer, sizeof(buffer))) > 0;)
+        output.append(buffer, static_cast<size_t>(n));
+    close(descriptors[0]);
+    return output;
+}
+
 /// Remove leading and trailing ASCII whitespace.
 static std::string trim(std::string s)
 {
@@ -266,16 +326,68 @@ static Result pingCheck(std::string test, const std::string& host, int timeoutMs
     return r;
 }
 
-/// Resolve an IPv4 address to a DNS name without falling back to numeric text.
+/// Normalize a resolver result and reject placeholders and numeric answers.
+static std::string usableHostName(std::string name, const std::string& ip)
+{
+    name = trim(name);
+    while (!name.empty() && (name.back() == '.' || name.back() == '\r'))
+        name.pop_back();
+    if (name.empty() || name == ip || name == "?" || name == "(null)" || name.find(' ') != std::string::npos)
+        return {};
+    return name;
+}
+
+/// Resolve an IPv4 address using bounded system DNS, local caches, mDNS, and optional LAN tools.
 static std::string reverseName(const std::string& ip)
 {
     sockaddr_in a {};
     a.sin_family = AF_INET;
-    inet_pton(AF_INET, ip.c_str(), &a.sin_addr);
-    char host[NI_MAXHOST] {};
-    return getnameinfo(reinterpret_cast<sockaddr*>(&a), sizeof(a), host, sizeof(host), nullptr, 0, NI_NAMEREQD) == 0
-        ? host
-        : "";
+    if (inet_pton(AF_INET, ip.c_str(), &a.sin_addr) != 1)
+        return {};
+
+    auto extract = [&](const std::string& output, const std::vector<std::regex>& patterns)
+    {
+        for (const auto& pattern: patterns)
+        {
+            std::smatch match;
+            if (std::regex_search(output, match, pattern))
+                if (auto name = usableHostName(match[1], ip); !name.empty())
+                    return name;
+        }
+        return std::string {};
+    };
+
+    std::string output;
+#ifdef __APPLE__
+    output = commandOutput({ "dscacheutil", "-q", "host", "-a", "ip_address", ip });
+    if (auto name = extract(output, { std::regex("(?:^|\\n)name: ([^\\r\\n]+)") }); !name.empty())
+        return name;
+    auto first = ip.find('.'), second = ip.find('.', first + 1), third = ip.find('.', second + 1);
+    auto reverse = ip.substr(third + 1) + "." + ip.substr(second + 1, third - second - 1) + "."
+        + ip.substr(first + 1, second - first - 1) + "." + ip.substr(0, first) + ".in-addr.arpa";
+    output = commandOutput({ "dns-sd", "-Q", reverse, "PTR" }, 800);
+    if (auto name = extract(output, { std::regex("PTR +([^ ]+?\\.?)\\s*(?:\\n|$)") }); !name.empty())
+        return name;
+#else
+    output = commandOutput({ "getent", "hosts", ip });
+    if (auto name = extract(output, { std::regex("^\\S+\\s+([^\\s]+)") }); !name.empty())
+        return name;
+    output = commandOutput({ "avahi-resolve-address", "-4", ip });
+    if (auto name = extract(output, { std::regex("\\S+\\s+([^\\s]+)") }); !name.empty())
+        return name;
+#endif
+
+    output = commandOutput({ "nslookup", ip });
+    if (auto name = extract(output, { std::regex("name = ([^\\s]+)"), std::regex("name: +([^\\s]+)") }); !name.empty())
+        return name;
+    output = commandOutput({ "host", ip });
+    if (auto name = extract(output, { std::regex("domain name pointer ([^\\s]+)") }); !name.empty())
+        return name;
+    output = commandOutput({ "dig", "+short", "-x", ip });
+    if (auto name = extract(output, { std::regex("^([^\\s]+)") }); !name.empty())
+        return name;
+    output = commandOutput({ "nmblookup", "-A", ip });
+    return extract(output, { std::regex("^\\s*([^\\s<]+)\\s+<00>", std::regex::multiline) });
 }
 
 /// Resolve the diagnostic hostname through one explicitly selected DNS server.
@@ -347,18 +459,80 @@ static std::map<std::string, std::pair<std::string, std::string>> arpTable()
     std::smatch                                                m;
     while (std::getline(in, line))
         if (std::regex_search(line, m, pattern))
-            result[m[2]] = { trim(m[1]), formatMac(m[3]) };
+        {
+            auto name = trim(m[1]);
+            result[m[2]] = { name == "?" ? "" : name, formatMac(m[3]) };
+        }
     return result;
 }
 
-/// Provide a fallback classification when no external OUI database is present.
+/// Load IEEE OUI assignments from the first available database location.
+static std::map<std::string, std::string> loadOuiDatabase()
+{
+    std::vector<std::string> paths;
+    if (const char* path = std::getenv("TNETVIEW_OUI_DB"); path && *path)
+        paths.emplace_back(path);
+    auto slash = programPath.rfind('/');
+    if (slash != std::string::npos)
+        paths.push_back(programPath.substr(0, slash + 1) + "ouidb.txt");
+    paths.emplace_back("ouidb.txt");
+
+    std::ifstream in;
+    for (const auto& path: paths)
+    {
+        in.open(path);
+        if (in)
+            break;
+        in.clear();
+    }
+
+    std::map<std::string, std::string> result;
+    std::string line;
+    while (std::getline(in, line))
+    {
+        std::istringstream fields(line);
+        std::string prefix;
+        fields >> prefix;
+        std::string vendor;
+        std::getline(fields, vendor);
+        vendor = trim(vendor);
+        if ((prefix.size() != 6 && prefix.size() != 7 && prefix.size() != 9) || vendor.empty()
+            || !std::all_of(prefix.begin(), prefix.end(), [](unsigned char ch) { return std::isxdigit(ch); }))
+            continue;
+        std::transform(prefix.begin(), prefix.end(), prefix.begin(),
+            [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
+        result[prefix] = vendor;
+    }
+    return result;
+}
+
+/// Return the vendor for a MAC, preferring the most specific IEEE assignment.
 static std::string vendorForMac(const std::string& mac)
 {
     if (mac.size() < 2)
         return {};
     unsigned first {};
     std::istringstream(mac.substr(0, 2)) >> std::hex >> first;
-    return first & 2 ? "locally administered" : (first & 1 ? "multicast" : "unknown vendor");
+    if (first & 2)
+        return "locally administered";
+    if (first & 1)
+        return "multicast";
+
+    std::string compact;
+    for (unsigned char ch: mac)
+        if (std::isxdigit(ch))
+            compact += static_cast<char>(std::toupper(ch));
+    if (compact.size() != 12)
+        return "unknown vendor";
+
+    static const auto database = loadOuiDatabase();
+    for (size_t length: { size_t(9), size_t(7), size_t(6) })
+    {
+        auto it = database.find(compact.substr(0, length));
+        if (it != database.end())
+            return it->second;
+    }
+    return "unknown vendor";
 }
 
 /// Return whether a short TCP connection to ip:port succeeds.
@@ -1093,14 +1267,14 @@ static void renderDevices(const std::vector<Device>& rows, size_t selected, bool
               << pad(" tnetview  LOCAL DEVICES (" + std::to_string(rows.size()) + ")  [" + progress + "]",
                      std::max<size_t>(30, width))
               << c(ansiReset) << "\n\n";
-    std::cout << c(ansiBold) << "  " << pad("IP ADDRESS", 16) << pad("WEB", 6) << pad("KNOWN", 8) << pad("NAME", 22)
-              << pad("MAC", 19) << pad("MAC VENDOR", 22) << "PORTS" << c(ansiReset) << "\n";
+    std::cout << c(ansiBold) << "  " << pad("IP ADDRESS", 16) << pad("WEB", 6) << pad("KNOWN", 8) << pad("NAME", 32)
+              << pad("MAC", 19) << pad("MAC VENDOR", 32) << "PORTS" << c(ansiReset) << "\n";
     for (size_t i = 0; i < rows.size(); ++i)
     {
         const auto& r    = rows[i];
         std::string line = (i == selected ? "> " : "  ") + pad(r.ip, 16)
             + pad((r.ports.find("80") != std::string::npos || r.ports.find("443") != std::string::npos) ? "yes" : "", 6)
-            + pad(r.known ? "[x]" : "[ ]", 8) + pad(r.name, 22) + pad(r.mac, 19) + pad(r.vendor, 22) + r.ports;
+            + pad(r.known ? "[x]" : "[ ]", 8) + pad(r.name, 32) + pad(r.mac, 19) + pad(r.vendor, 32) + r.ports;
         std::cout << c(i == selected ? ansiBlackOnCyan : ansiBrightGreen) << fitTerminalLine(line, width)
                   << c(ansiReset) << "\n";
     }
@@ -1415,6 +1589,7 @@ static void startInterfaces(const std::shared_ptr<AppState>& state)
 int main(int argc, char* argv[])
 try
 {
+    programPath = argv[0];
     ut1::CommandLineParser cl("tnetview", "Usage: tnetview [options]\n\nColorful terminal network status monitor.",
         "\n$programName version $version ($compileDate) *** Copyright (c) 2026 Johannes Overmann *** https://github.com/jovermann/tnetview",
         Version);

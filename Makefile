@@ -12,8 +12,8 @@ OBJECTS := $(SOURCES:src/%.cpp=build-$(BUILD)/%.o)
 
 default: $(TARGET)
 
-$(TARGET): $(OBJECTS)
-	$(CXX) $^ -o $@
+$(TARGET): $(OBJECTS) ouidb.txt
+	$(CXX) $(OBJECTS) -o $@
 
 build-$(BUILD)/%.o: src/%.cpp
 	@mkdir -p $(@D)

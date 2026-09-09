@@ -11,7 +11,10 @@ run in background workers.
   configured DNS servers, forward and reverse DNS, ICMP reachability, HTTPS,
   captive portals, traceroute, and possible DNS hijacking.
 - Fast `/24` local-device discovery using parallel ICMP probes and the ARP cache.
-- Asynchronous reverse-name lookup and inspection of ports 22, 80, and 443.
+- Asynchronous host-name lookup through ARP, system DNS, local caches, mDNS,
+  Avahi, and NetBIOS (where available), plus inspection of ports 22, 80, and 443.
+- MAC vendor lookup using IEEE MA-L, MA-M, and MA-S assignments from
+  `ouidb.txt`.
 - Persistent known devices with editable user names, stored by MAC address in
   `~/.tnetview-known.tsv`.
 - Interface and external-tool prerequisite pages.
@@ -52,6 +55,9 @@ make clean
 ```
 
 The resulting executable is `./tnetview`.
+
+Keep `ouidb.txt` beside the executable (or in the working directory) for MAC
+vendor lookup. Set `TNETVIEW_OUI_DB` to use a database at another path.
 
 ## Runtime prerequisites
 
