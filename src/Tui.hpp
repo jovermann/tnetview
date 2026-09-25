@@ -58,6 +58,7 @@ public:
     /// Enable raw mode on fd. Throws std::runtime_error if fd is not a terminal
     /// or if terminal settings cannot be read or changed.
     explicit TerminalRawMode(int fd);
+    TerminalRawMode(int fd, bool disableSignals);
 
     /// Restore previous terminal settings and show the cursor.
     ~TerminalRawMode();
@@ -76,6 +77,8 @@ size_t terminalHeight();
 
 /// Return terminal width in columns, or 120 when it cannot be queried.
 size_t terminalWidth();
+/// Display columns occupied by UTF-8 text (without ANSI escape sequences).
+size_t terminalTextWidth(const std::string& text);
 
 /// Truncate a plain, non-ANSI line to fit width columns.
 /// Uses "..." when there is room; callers should apply ANSI colors after this.
@@ -90,6 +93,10 @@ constexpr int keyUp   = 0x100;
 constexpr int keyDown = 0x101;
 constexpr int keyPageUp = 0x102;
 constexpr int keyPageDown = 0x103;
+constexpr int keyLeft = 0x104;
+constexpr int keyRight = 0x105;
+constexpr int keyHome = 0x106;
+constexpr int keyEnd = 0x107;
 
 /// Read a key and decode common ANSI cursor and page-key sequences.
 int readKey(int timeoutMs = -1);
