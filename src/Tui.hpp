@@ -41,8 +41,9 @@ extern const char* const ansiBrightMagenta;
 extern const char* const ansiBrightCyan;
 extern const char* const ansiBrightWhite;
 
-/// Foreground/background combinations currently used by treeop.
+/// Foreground/background combinations for terminal interfaces.
 extern const char* const ansiWhiteOnBlue;
+extern const char* const ansiWhiteOnGray;
 extern const char* const ansiWhiteOnRed;
 extern const char* const ansiBlackOnCyan;
 
@@ -107,6 +108,29 @@ void clearScreen();
 /// Enter/leave the terminal's alternate screen buffer.
 void enterAlternateScreen();
 void leaveAlternateScreen();
+
+/// RAII guard for the alternate screen buffer and hidden cursor.
+///
+/// Enters the alternate screen on construction and restores the original
+/// screen and cursor on destruction, including when an exception is thrown.
+class AlternateScreen
+{
+public:
+    /// Enter the alternate screen and hide the cursor.
+    AlternateScreen();
+
+    /// Restore the original screen and show the cursor.
+    ~AlternateScreen();
+
+    AlternateScreen(const AlternateScreen&) = delete;
+    AlternateScreen& operator=(const AlternateScreen&) = delete;
+};
+
+/// Print one colored plain-text line, fitted to width columns.
+///
+/// Writes color, the truncated line, an ANSI reset, and a newline to os.
+/// The caller must supply a valid ANSI color sequence and an output stream.
+void printColoredLine(std::ostream& os, const std::string& line, size_t width, const char* color);
 
 /// Print a matrix of ANSI background/foreground color combinations.
 ///

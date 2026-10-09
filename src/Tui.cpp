@@ -42,6 +42,7 @@ const char* const ansiBrightMagenta = "\033[95m";
 const char* const ansiBrightCyan = "\033[96m";
 const char* const ansiBrightWhite = "\033[97m";
 const char* const ansiWhiteOnBlue = "\033[44;37m";
+const char* const ansiWhiteOnGray = "\033[100;37m";
 const char* const ansiWhiteOnRed = "\033[41;37m";
 const char* const ansiBlackOnCyan = "\033[46;30m";
 
@@ -243,6 +244,21 @@ void enterAlternateScreen()
 void leaveAlternateScreen()
 {
     std::cout << "\033[?1049l\033[?25h" << std::flush;
+}
+
+AlternateScreen::AlternateScreen()
+{
+    enterAlternateScreen();
+}
+
+AlternateScreen::~AlternateScreen()
+{
+    leaveAlternateScreen();
+}
+
+void printColoredLine(std::ostream& os, const std::string& line, size_t width, const char* color)
+{
+    os << color << fitTerminalLine(line, width) << ansiReset << '\n';
 }
 
 void printAnsiColorMatrix(std::ostream& os, size_t maxRows, size_t maxWidth)
