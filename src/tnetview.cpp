@@ -27,12 +27,17 @@
 #include <mutex>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <optional>
 #include <regex>
 #include <signal.h>
 #include <spawn.h>
 #include <sstream>
 #include <string>
 #include <sys/socket.h>
+#ifdef __APPLE__
+#include <net/route.h>
+#include <sys/sysctl.h>
+#endif
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <thread>
@@ -57,6 +62,7 @@ struct Result
     std::string timing;
     std::string detail;
     bool        ready { true };
+    bool        available { true };
 };
 
 /// IPv4 interface information displayed on the Interfaces page.
@@ -87,6 +93,33 @@ struct Device
     bool        known {};
 };
 
+/// One IPv4 neighbor-cache entry, including unresolved entries for diagnostics.
+struct ArpEntry
+{
+    std::string ip;
+    std::string mac;
+    std::string interfaceName;
+    std::string state;
+};
+
+/// One ARP table read and the evidence needed to diagnose an empty result.
+struct ArpSnapshot
+{
+    std::vector<ArpEntry> entries;
+    std::string raw;
+    std::string diagnostic;
+};
+
+/// A directly observed link-layer neighbor reported by the local LLDP daemon.
+struct LldpNeighbor
+{
+    std::string interfaceName;
+    std::string chassisMac;
+    std::string name;
+    std::string remotePort;
+    std::string capability;
+};
+
 /// User-maintained device identity persisted by normalized MAC address.
 struct KnownDevice
 {
@@ -103,19 +136,39 @@ struct AppState
     std::mutex                mutex;
     std::vector<Result>       status;
     std::vector<Device>       devices;
+    ArpSnapshot               arp;
+    std::vector<LldpNeighbor> neighbors;
     std::vector<Prerequisite> prereqs;
     std::vector<Interface>    ifaces;
     std::string               gatewayAddress;
     std::vector<std::string>  dnsAddresses;
     bool                      statusBusy {}, devicesBusy {}, prereqBusy {};
     bool                      devicesEnrichBusy {};
+    bool                      lldpBusy {};
+    bool                      arpBusy {};
     bool                      interfaceBusy {};
     size_t                    statusDone {}, statusTotal { 17 };
     unsigned                  devicesDone {}, devicesTotal { 254 };
     unsigned                  devicesEnrichDone {}, devicesEnrichTotal {};
     uint64_t                  statusGeneration {}, devicesGeneration {}, prereqGeneration {};
     uint64_t                  interfaceGeneration {};
+    uint64_t                  arpGeneration {};
 };
+
+/// Requested diagnostic detail level: 0 quiet, 1 summary, 2 raw ARP data.
+static unsigned verboseLevel {};
+
+/// Prevent concurrent network workers from interleaving diagnostic lines.
+static std::mutex debugMutex;
+
+/// Emit a diagnostic line when the requested verbosity includes its level.
+static void debugLog(unsigned level, const std::string& message)
+{
+    if (verboseLevel < level)
+        return;
+    std::lock_guard lock(debugMutex);
+    std::cerr << "tnetview: " << message << '\n';
+}
 
 /// Set by the signal handler and polled by the interactive event loop.
 static volatile sig_atomic_t interrupted {};
@@ -436,33 +489,119 @@ static std::string formatMac(std::string mac)
     return count == 6 ? result : "";
 }
 
-/// Return the default gateway's normalized MAC address from the ARP cache.
-static std::string gatewayMac(const std::string& gw)
+/// Read the local LLDP daemon's key/value snapshot without requiring an IP address on the peer.
+static std::vector<LldpNeighbor> lldpNeighbors()
+{
+    auto output = commandOutput({ "lldpcli", "-f", "keyvalue", "show", "neighbors", "details" }, 2000);
+    std::vector<LldpNeighbor> parsed;
+    std::map<std::string, size_t> currentByInterface;
+    std::istringstream in(output);
+    std::string line;
+    while (std::getline(in, line))
+    {
+        if (line.rfind("lldp.", 0) != 0)
+            continue;
+        auto equal = line.find('=');
+        auto dot = line.find('.', 5);
+        if (equal == std::string::npos || dot == std::string::npos || dot >= equal)
+            continue;
+        auto interfaceName = line.substr(5, dot - 5);
+        auto field = line.substr(dot + 1, equal - dot - 1);
+        auto value = trim(line.substr(equal + 1));
+        auto current = currentByInterface.find(interfaceName);
+        if (current == currentByInterface.end())
+        {
+            currentByInterface[interfaceName] = parsed.size();
+            parsed.push_back({});
+            current = currentByInterface.find(interfaceName);
+        }
+        if (field == "chassis.mac" && !parsed[current->second].chassisMac.empty()
+            && parsed[current->second].chassisMac != formatMac(value))
+        {
+            current->second = parsed.size();
+            parsed.push_back({});
+        }
+        auto& neighbor = parsed[current->second];
+        neighbor.interfaceName = interfaceName;
+        if (field == "chassis.mac")
+            neighbor.chassisMac = formatMac(value);
+        else if (field == "chassis.name")
+            neighbor.name = value;
+        else if (field == "port.ifname" || (field == "port.local" && neighbor.remotePort.empty()))
+            neighbor.remotePort = value;
+        else if (field == "chassis.Bridge" && value == "on")
+            neighbor.capability = "switch/bridge";
+        else if (field == "chassis.Router" && value == "on")
+            neighbor.capability = "router";
+    }
+    std::vector<LldpNeighbor> result;
+    for (auto& neighbor: parsed)
+        if (!neighbor.chassisMac.empty() || !neighbor.name.empty())
+            result.push_back(std::move(neighbor));
+    return result;
+}
+
+/// Read and parse the neighbor cache while retaining unresolved ARP rows.
+static ArpSnapshot readArpSnapshot()
+{
+    ArpSnapshot snapshot;
+    snapshot.raw = commandOutput({ "arp", "-an" }, 2000);
+    std::istringstream in(snapshot.raw);
+    std::string line;
+    const std::regex pattern("^.*\\(([^)]+)\\) at ([^ ]+)(?: on ([^ ]+))?.*$");
+    std::smatch match;
+    while (std::getline(in, line))
+        if (std::regex_match(line, match, pattern))
+        {
+            auto mac = formatMac(match[2]);
+            snapshot.entries.push_back({ match[1], mac, match[3], mac.empty() ? "incomplete" : "resolved" });
+        }
+    if (snapshot.raw.empty())
+    {
+        snapshot.diagnostic = "arp -an returned no data";
+#ifdef __APPLE__
+        int mib[] = { CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_FLAGS, RTF_LLINFO };
+        size_t bytes = 0;
+        errno = 0;
+        int result = sysctl(mib, 6, nullptr, &bytes, nullptr, 0);
+        int error = errno;
+        snapshot.diagnostic += "; IPv4 route sysctl: result=" + std::to_string(result)
+            + ", bytes=" + std::to_string(bytes) + ", errno=" + std::to_string(error);
+#endif
+    }
+    else
+        snapshot.diagnostic = std::to_string(snapshot.entries.size()) + " entries from arp -an";
+    debugLog(1, "ARP: " + snapshot.diagnostic);
+    if (verboseLevel >= 2)
+    {
+        std::istringstream raw(snapshot.raw);
+        while (std::getline(raw, line))
+            debugLog(2, "ARP raw: " + line);
+    }
+    return snapshot;
+}
+
+/// Return the gateway MAC, or nullopt when the ARP table cannot be read.
+static std::optional<std::string> gatewayMac(const std::string& gw)
 {
     if (gw.empty())
-        return {};
-    auto        out = commandOutput("arp -an 2>/dev/null");
-    std::smatch m;
-    if (std::regex_search(out, m, std::regex("\\(" + gw + "\\) at ([0-9a-fA-F:]+)")))
-        return formatMac(m[1]);
-    return {};
+        return std::string {};
+    auto snapshot = readArpSnapshot();
+    if (snapshot.raw.empty())
+        return std::nullopt;
+    for (const auto& entry: snapshot.entries)
+        if (entry.ip == gw && !entry.mac.empty())
+            return entry.mac;
+    return std::string {};
 }
 
 /// Parse the operating system's ARP table into IP-to-(name, MAC) entries.
 static std::map<std::string, std::pair<std::string, std::string>> arpTable()
 {
     std::map<std::string, std::pair<std::string, std::string>> result;
-    auto                                                       out = commandOutput("arp -an 2>/dev/null");
-    std::istringstream                                         in(out);
-    std::string                                                line;
-    std::regex                                                 pattern("^(.*?) ?\\(([^)]+)\\) at ([0-9a-fA-F:]+)");
-    std::smatch                                                m;
-    while (std::getline(in, line))
-        if (std::regex_search(line, m, pattern))
-        {
-            auto name = trim(m[1]);
-            result[m[2]] = { name == "?" ? "" : name, formatMac(m[3]) };
-        }
+    for (const auto& entry: readArpSnapshot().entries)
+        if (!entry.mac.empty())
+            result[entry.ip] = { {}, entry.mac };
     return result;
 }
 
@@ -991,7 +1130,9 @@ static std::vector<Result> runChecks(
         [=]
         {
             auto mac = gatewayMac(gw);
-            return Result { !mac.empty(), "Gateway ARP", gw, {}, mac.empty() ? "not found" : mac };
+            if (!mac)
+                return Result { false, "Gateway ARP", gw, {}, "ARP table unavailable", true, false };
+            return Result { !mac->empty(), "Gateway ARP", gw, {}, mac->empty() ? "not found" : *mac };
         }));
     jobs.push_back(std::async(std::launch::async,
         [=]
@@ -1156,12 +1297,13 @@ static void renderStatus(
     {
         return color ? x : "";
     };
-    size_t                      ok = 0;
+    size_t                      ok = 0, applicable = 0;
     std::map<std::string, bool> passed;
     for (const auto& r: rows)
-        if (r.ready)
+        if (r.ready && r.available)
         {
             ok += r.ok;
+            ++applicable;
             passed[r.test] = r.ok;
         }
     std::string summary = busy
@@ -1175,18 +1317,18 @@ static void renderStatus(
                      std::max<size_t>(30, width))
               << c(ansiReset) << "\n";
     std::cout << c(summary == "Internet access OK" ? ansiBrightGreen : ansiBrightYellow) << "  " << summary << "  —  "
-              << ok << "/" << rows.size() << " checks passed" << c(ansiReset) << "\n\n";
+              << ok << "/" << (busy ? rows.size() : applicable) << " checks passed" << c(ansiReset) << "\n\n";
     std::cout << c(ansiBold) << "  " << pad("STATUS", 9) << pad("TEST", 25) << pad("IP", 18) << pad("PING", 10)
               << "DETAILS" << c(ansiReset) << "\n";
     for (const auto& r: rows)
     {
-        const char* state = !r.ready ? ansiGray : (r.ok ? ansiBrightGreen : ansiBrightRed);
-        std::string line  = "  " + pad(!r.ready ? "..." : (r.ok ? "PASS" : "FAIL"), 9) + pad(r.test, 25)
+        const char* state = !r.ready || !r.available ? ansiGray : (r.ok ? ansiBrightGreen : ansiBrightRed);
+        std::string line  = "  " + pad(!r.ready ? "..." : (!r.available ? "N/A" : (r.ok ? "PASS" : "FAIL")), 9) + pad(r.test, 25)
             + pad(r.target, 18) + pad(r.timing, 10) + r.detail;
         std::cout << c(state) << fitTerminalLine(line, width) << c(ansiReset) << "\n";
     }
     if (fullScreen)
-        printMenu(" 1 Status   2 Local Devices   3 Known Devices   4 Interfaces   5 Prerequisites",
+        printMenu(" 1 Status   2 Local   3 Known   4 Interfaces   5 Tools   6 Tree   7 ARP",
             "  r Refresh   t Colors   q Quit", width, color);
 }
 /// Render local interfaces and asynchronously queried resolver/routing data.
@@ -1213,7 +1355,7 @@ static void renderInterfaces(const std::vector<Interface>& rows, const std::stri
     for (const auto& s: dnsAddresses)
         std::cout << s << ' ';
     std::cout << c(ansiReset);
-    printMenu(" 1 Status   2 Local Devices   3 Known Devices   4 Interfaces   5 Prerequisites",
+    printMenu(" 1 Status   2 Local   3 Known   4 Interfaces   5 Tools   6 Tree   7 ARP",
         "  r Refresh   t Colors   q Quit", width, color);
 }
 
@@ -1245,7 +1387,7 @@ static void renderPrerequisites(const std::vector<Prerequisite>& rows, bool busy
                              + (r.path.empty() ? "not found" : r.path),
                          width)
                   << c(ansiReset) << "\n";
-    printMenu(" 1 Status   2 Local Devices   3 Known Devices   4 Interfaces   5 Prerequisites",
+    printMenu(" 1 Status   2 Local   3 Known   4 Interfaces   5 Tools   6 Tree   7 ARP",
         "  r Refresh   t Colors   q Quit", width, color);
 }
 
@@ -1278,8 +1420,179 @@ static void renderDevices(const std::vector<Device>& rows, size_t selected, bool
         std::cout << c(i == selected ? ansiBlackOnCyan : ansiBrightGreen) << fitTerminalLine(line, width)
                   << c(ansiReset) << "\n";
     }
-    printMenu(" 1 Status   2 Local Devices   3 Known Devices   4 Interfaces   5 Prerequisites",
+    printMenu(" 1 Status   2 Local   3 Known   4 Interfaces   5 Tools   6 Tree   7 ARP",
         "  Up/Down Select   Space Toggle known   r Rescan   t Colors   q Quit", width, color);
+}
+
+/// Remove terminal control bytes from labels supplied by network peers and DNS.
+static std::string safeTopologyLabel(const std::string& value)
+{
+    std::string out;
+    for (unsigned char ch: value)
+        if (ch >= 32 && ch != 127)
+            out += static_cast<char>(ch);
+    return out;
+}
+
+/// Build a tree containing only proven LLDP links and a separate unknown-link branch.
+static std::vector<std::string> topologyLines(const std::vector<Device>& devices,
+    const std::vector<LldpNeighbor>& neighbors, const std::vector<KnownDevice>& known,
+    const std::vector<Interface>& ifaces, const std::string& gw)
+{
+    std::vector<std::string> lines { "Local network" };
+    std::string localIp;
+    for (const auto& iface: ifaces)
+        if (iface.address != "127.0.0.1" && !iface.address.empty())
+        {
+            localIp = iface.address;
+            break;
+        }
+    lines.push_back("+- This computer" + (localIp.empty() ? "" : " (" + localIp + ")"));
+    std::vector<std::string> linkedMacs;
+    for (const auto& neighbor: neighbors)
+    {
+        const Device* match = nullptr;
+        for (const auto& device: devices)
+            if (!neighbor.chassisMac.empty() && device.mac == neighbor.chassisMac)
+            {
+                match = &device;
+                break;
+            }
+        std::string name = neighbor.name;
+        for (const auto& item: known)
+            if (item.mac == neighbor.chassisMac && !item.userName.empty())
+                name = item.userName;
+        if (name.empty() && match && !match->name.empty())
+            name = match->name;
+        if (name.empty())
+            name = neighbor.chassisMac.empty() ? "LLDP neighbor" : neighbor.chassisMac;
+        std::string detail = neighbor.capability.empty() ? "device" : neighbor.capability;
+        if (match && !match->ip.empty())
+            detail += ", " + match->ip;
+        else if (!neighbor.chassisMac.empty())
+            detail += ", " + neighbor.chassisMac;
+        lines.push_back("|  +- " + safeTopologyLabel(neighbor.interfaceName) + " -> " + safeTopologyLabel(name)
+            + " [" + detail + ", LLDP]"
+            + (neighbor.remotePort.empty() ? "" : " port " + safeTopologyLabel(neighbor.remotePort)));
+        if (!neighbor.chassisMac.empty())
+            linkedMacs.push_back(neighbor.chassisMac);
+    }
+    if (neighbors.empty())
+        lines.push_back("|  +- No LLDP neighbor reported");
+    lines.push_back("+- Link unknown (Ping/ARP)");
+    size_t count = 0;
+    for (const auto& device: devices)
+    {
+        if (device.ip == localIp || (!device.mac.empty()
+            && std::find(linkedMacs.begin(), linkedMacs.end(), device.mac) != linkedMacs.end()))
+            continue;
+        std::string name = device.name;
+        for (const auto& item: known)
+            if (!device.mac.empty() && item.mac == device.mac && !item.userName.empty())
+                name = item.userName;
+        std::string label = device.ip == gw ? "gateway" : "device";
+        lines.push_back("   +- " + label + " " + safeTopologyLabel(device.ip)
+            + (name.empty() ? "" : " " + safeTopologyLabel(name))
+            + (device.mac.empty() ? "" : " [" + device.mac + "]"));
+        ++count;
+    }
+    if (!count)
+        lines.push_back("   +- No other device found yet");
+    return lines;
+}
+
+/// Render the scrollable network tree with its evidence and discovery status.
+static void renderTopology(const std::vector<std::string>& lines, size_t scroll, bool busy,
+    bool lldpBusy, bool color)
+{
+    using namespace ut1::tui;
+    clearScreen();
+    auto width = terminalWidth();
+    std::cout << (color ? ansiWhiteOnBlue : "")
+              << pad(" tnetview  NETWORK TREE  [" + std::string(busy || lldpBusy ? "SCANNING" : "IDLE") + "]",
+                     std::max<size_t>(30, width))
+              << (color ? ansiReset : "") << "\n";
+    std::cout << (color ? ansiBrightYellow : "")
+              << fitTerminalLine("  Solid links: local LLDP only. Other devices: physical link unknown.", width)
+              << (color ? ansiReset : "") << "\n\n";
+    size_t visible = terminalHeight() > 8 ? terminalHeight() - 8 : 1;
+    for (size_t i = scroll; i < lines.size() && i < scroll + visible; ++i)
+        std::cout << (color ? ansiBrightGreen : "") << fitTerminalLine("  " + lines[i], width)
+                  << (color ? ansiReset : "") << "\n";
+    printMenu(" 1 Status   2 Local   3 Known   4 Interfaces   5 Tools   6 Tree   7 ARP",
+        "  Up/Down Scroll   r Rescan   t Colors   q Quit", width, color);
+}
+
+/// Render a scrollable view of the raw ARP table and access diagnosis.
+static void renderArp(const ArpSnapshot& snapshot, const std::string& gw, size_t scroll, bool busy, bool color)
+{
+    using namespace ut1::tui;
+    clearScreen();
+    auto width = terminalWidth();
+    std::cout << (color ? ansiWhiteOnBlue : "")
+              << pad(" tnetview  ARP (" + std::to_string(snapshot.entries.size()) + ")  ["
+                      + (busy ? "READING" : "IDLE") + "]", std::max<size_t>(30, width))
+              << (color ? ansiReset : "") << "\n";
+    std::cout << (color ? ansiBrightYellow : "")
+              << fitTerminalLine("  " + (busy ? "Reading arp -an..." : snapshot.diagnostic), width)
+              << (color ? ansiReset : "") << "\n\n";
+    std::cout << (color ? ansiBold : "") << "  " << pad("IP ADDRESS", 18) << pad("MAC ADDRESS", 20)
+              << pad("INTERFACE", 14) << "STATE" << (color ? ansiReset : "") << "\n";
+    size_t visible = terminalHeight() > 9 ? terminalHeight() - 9 : 1;
+    for (size_t i = scroll; i < snapshot.entries.size() && i < scroll + visible; ++i)
+    {
+        const auto& row = snapshot.entries[i];
+        auto line = "  " + pad(row.ip, 18) + pad(row.mac, 20) + pad(row.interfaceName, 14)
+            + (row.ip == gw ? "gateway, " : "") + row.state;
+        std::cout << (color ? (row.mac.empty() ? ansiGray : ansiBrightGreen) : "")
+                  << fitTerminalLine(line, width) << (color ? ansiReset : "") << "\n";
+    }
+    printMenu(" 1 Status   2 Local   3 Known   4 Interfaces   5 Tools   6 Tree   7 ARP",
+        "  Up/Down Scroll   r Refresh   q Quit", width, color);
+}
+
+/// Keep ARP availability visible on the terminal's last row on every main page.
+static void renderArpFooter(const ArpSnapshot& snapshot, bool busy, bool color)
+{
+    using namespace ut1::tui;
+    std::string message;
+    const char* shade = ansiBrightYellow;
+    if (busy)
+        message = " ARP: checking...";
+    else if (snapshot.raw.empty())
+    {
+        message = geteuid() == 0 ? " ARP: unavailable (see 7 for details)"
+                                : " ARP: unavailable - restart with sudo ./tnetview";
+        shade = ansiBrightRed;
+    }
+    else if (snapshot.entries.empty())
+    {
+        message = " ARP: output unreadable - press 7 for details";
+        shade = ansiBrightRed;
+    }
+    else
+    {
+        size_t resolved = 0;
+        for (const auto& entry: snapshot.entries)
+            resolved += !entry.mac.empty();
+        message = " ARP: OK (" + std::to_string(resolved) + " resolved, "
+            + std::to_string(snapshot.entries.size() - resolved) + " incomplete)";
+        shade = ansiBrightGreen;
+    }
+    message += "   7 Details   q Quit";
+    auto width = terminalWidth();
+    std::cout << "\033[" << terminalHeight() << ";1H\033[2K"
+              << (color ? shade : "") << fitTerminalLine(message, width > 1 ? width - 1 : 1)
+              << (color ? ansiReset : "") << std::flush;
+}
+
+/// Print a one-shot ARP report for testing outside an interactive terminal.
+static void printArpReport(const ArpSnapshot& snapshot)
+{
+    std::cout << "ARP: " << snapshot.diagnostic << '\n';
+    for (const auto& row: snapshot.entries)
+        std::cout << row.ip << '\t' << (row.mac.empty() ? "-" : row.mac) << '\t'
+                  << row.interfaceName << '\t' << row.state << '\n';
 }
 
 /// Render persisted known devices and the current selection.
@@ -1306,7 +1619,7 @@ static void renderKnown(const std::vector<KnownDevice>& rows, size_t selected, b
         std::cout << c(i == selected ? ansiBlackOnCyan : ansiBrightGreen) << fitTerminalLine(line, width)
                   << c(ansiReset) << "\n";
     }
-    printMenu(" 1 Status   2 Local Devices   3 Known Devices   4 Interfaces   5 Prerequisites",
+    printMenu(" 1 Status   2 Local   3 Known   4 Interfaces   5 Tools   6 Tree   7 ARP",
         "  Up/Down Select   n Rename   d Delete   t Colors   q Quit", width, color);
 }
 
@@ -1446,11 +1759,25 @@ static void startDeviceScan(const std::shared_ptr<AppState>& state)
         std::lock_guard lock(state->mutex);
         generation = ++state->devicesGeneration;
         state->devices.clear();
+        state->neighbors.clear();
         state->devicesBusy       = true;
         state->devicesEnrichBusy = false;
+        state->lldpBusy          = true;
         state->devicesDone       = 0;
         state->devicesEnrichDone = 0;
     }
+    std::thread(
+        [state, generation]
+        {
+            auto neighbors = lldpNeighbors();
+            std::lock_guard lock(state->mutex);
+            if (generation == state->devicesGeneration)
+            {
+                state->neighbors = std::move(neighbors);
+                state->lldpBusy = false;
+            }
+        })
+        .detach();
     std::thread(
         [state, generation]
         {
@@ -1585,6 +1912,30 @@ static void startInterfaces(const std::shared_ptr<AppState>& state)
         .detach();
 }
 
+/// Refresh the ARP page without blocking keyboard input.
+static void startArpScan(const std::shared_ptr<AppState>& state)
+{
+    uint64_t generation;
+    {
+        std::lock_guard lock(state->mutex);
+        generation = ++state->arpGeneration;
+        state->arp = {};
+        state->arpBusy = true;
+    }
+    std::thread(
+        [state, generation]
+        {
+            auto snapshot = readArpSnapshot();
+            std::lock_guard lock(state->mutex);
+            if (generation == state->arpGeneration)
+            {
+                state->arp = std::move(snapshot);
+                state->arpBusy = false;
+            }
+        })
+        .detach();
+}
+
 /// Parse options and run either a one-shot report or the interactive event loop.
 int main(int argc, char* argv[])
 try
@@ -1596,9 +1947,12 @@ try
     cl.addOption('t', "timeout", "Connection timeout in milliseconds.", "MS", "1000");
     cl.addOption(0, "retries", "Number of ICMP ping attempts.", "COUNT", "5");
     cl.addOption('i', "interval", "Auto-refresh interval in seconds (0 disables).", "SECONDS", "0");
+    cl.addOption('v', "verbose", "Print diagnostics; repeat for raw ARP output.");
     cl.addOption(0, "once", "Print the status page once and exit.");
+    cl.addOption(0, "arp", "Print the ARP table and access diagnosis once, then exit.");
     cl.addOption(0, "colors", "Show all ANSI color combinations and exit.");
     cl.parse(argc, argv);
+    verboseLevel = cl.getCount("verbose");
     auto timeout = cl.getInt("timeout"), interval = cl.getInt("interval"), retries = cl.getInt("retries");
     if (timeout < 1 || timeout > 60000 || interval < 0 || retries < 1 || retries > 20)
     {
@@ -1609,6 +1963,11 @@ try
     if (cl.isSet("colors"))
     {
         ut1::tui::printAnsiColorMatrix(std::cout, 16);
+        return 0;
+    }
+    if (cl.isSet("arp"))
+    {
+        printArpReport(readArpSnapshot());
         return 0;
     }
     if (cl.isSet("once") || !isatty(STDIN_FILENO))
@@ -1622,6 +1981,7 @@ try
     size_t selected = 0;
     startStatus(state, static_cast<int>(timeout), static_cast<int>(retries));
     startInterfaces(state);
+    startArpScan(state);
     signal(SIGINT, onSignal);
     signal(SIGTERM, onSignal);
     ut1::tui::TerminalRawMode raw(STDIN_FILENO);
@@ -1633,17 +1993,21 @@ try
     {
         std::vector<Result>       rows;
         std::vector<Device>       devices;
+        ArpSnapshot               arp;
+        std::vector<LldpNeighbor> neighbors;
         std::vector<Prerequisite> prereqs;
         std::vector<Interface>    ifaces;
         std::string               gw;
         std::vector<std::string>  dns;
-        bool                      statusBusy, devicesBusy, devicesEnrichBusy, prereqBusy, interfaceBusy;
+        bool                      statusBusy, devicesBusy, devicesEnrichBusy, lldpBusy, arpBusy, prereqBusy, interfaceBusy;
         size_t                    statusDone, statusTotal;
         unsigned                  devicesDone, devicesTotal, devicesEnrichDone, devicesEnrichTotal;
         {
             std::lock_guard lock(state->mutex);
             rows               = state->status;
             devices            = state->devices;
+            arp                = state->arp;
+            neighbors          = state->neighbors;
             prereqs            = state->prereqs;
             ifaces             = state->ifaces;
             gw                 = state->gatewayAddress;
@@ -1651,6 +2015,8 @@ try
             statusBusy         = state->statusBusy;
             devicesBusy        = state->devicesBusy;
             devicesEnrichBusy  = state->devicesEnrichBusy;
+            lldpBusy           = state->lldpBusy;
+            arpBusy            = state->arpBusy;
             prereqBusy         = state->prereqBusy;
             interfaceBusy      = state->interfaceBusy;
             statusDone         = state->statusDone;
@@ -1672,8 +2038,15 @@ try
             renderKnown(known, selected, color);
         else if (page == 4)
             renderInterfaces(ifaces, gw, dns, interfaceBusy, color);
-        else
+        else if (page == 5)
             renderPrerequisites(prereqs, prereqBusy, color);
+        else if (page == 6)
+            renderTopology(topologyLines(devices, neighbors, known, ifaces, gw), selected,
+                devicesBusy || devicesEnrichBusy, lldpBusy, color);
+        else
+            renderArp(arp, gw, selected, arpBusy, color);
+        if (!showColors)
+            renderArpFooter(arp, arpBusy, color);
         int key = ut1::tui::readKey(100);
         if (key == ut1::tui::keyUp)
             key = 'k';
@@ -1682,7 +2055,10 @@ try
         if (interval && Clock::now() >= nextRefresh)
         {
             if (page == 1)
+            {
                 startStatus(state, static_cast<int>(timeout), static_cast<int>(retries));
+                startArpScan(state);
+            }
             nextRefresh = Clock::now() + std::chrono::seconds(interval);
         }
         if (interrupted)
@@ -1723,12 +2099,29 @@ try
             if (prereqs.empty() && !prereqBusy)
                 startPrerequisites(state);
             break;
+        case '6':
+            page       = 6;
+            selected   = 0;
+            showColors = false;
+            if (devices.empty() && !devicesBusy)
+                startDeviceScan(state);
+            break;
+        case '7':
+            page       = 7;
+            selected   = 0;
+            showColors = false;
+            startArpScan(state);
+            break;
         case 'j':
             if ((page == 2 && selected + 1 < devices.size()) || (page == 3 && selected + 1 < known.size()))
                 ++selected;
+            else if (page == 6 && selected + 1 < topologyLines(devices, neighbors, known, ifaces, gw).size())
+                ++selected;
+            else if (page == 7 && selected + 1 < arp.entries.size())
+                ++selected;
             break;
         case 'k':
-            if ((page == 2 || page == 3) && selected > 0)
+            if ((page == 2 || page == 3 || page == 6 || page == 7) && selected > 0)
                 --selected;
             break;
         case ' ':
@@ -1772,7 +2165,10 @@ try
         case 'r':
         case 'R':
             if (page == 1)
+            {
                 startStatus(state, static_cast<int>(timeout), static_cast<int>(retries));
+                startArpScan(state);
+            }
             else if (page == 2)
             {
                 startDeviceScan(state);
@@ -1782,8 +2178,19 @@ try
                 known = loadKnown();
             else if (page == 4)
                 startInterfaces(state);
-            else
+            else if (page == 5)
                 startPrerequisites(state);
+            else if (page == 6)
+            {
+                startDeviceScan(state);
+                startInterfaces(state);
+                selected = 0;
+            }
+            else if (page == 7)
+            {
+                startArpScan(state);
+                selected = 0;
+            }
             break;
         default:
             break;

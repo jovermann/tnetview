@@ -11,6 +11,8 @@ run in background workers.
   configured DNS servers, forward and reverse DNS, ICMP reachability, HTTPS,
   captive portals, traceroute, and possible DNS hijacking.
 - Fast `/24` local-device discovery using parallel ICMP probes and the ARP cache.
+- Scrollable network tree with directly observed LLDP neighbors, including peers
+  without an IP address, and a separate branch for devices with unknown links.
 - Asynchronous host-name lookup through ARP, system DNS, local caches, mDNS,
   Avahi, and NetBIOS (where available), plus inspection of ports 22, 80, and 443.
 - MAC vendor lookup using IEEE MA-L, MA-M, and MA-S assignments from
@@ -24,6 +26,14 @@ run in background workers.
 Page headers report `BUSY`, `SCANNING`, `INSPECTING`, or `IDLE`. Status tests
 show `...` until their individual results arrive. `q` and Ctrl-C remain
 responsive during network operations and restore the terminal before exiting.
+The bottom line of each main page shows whether ARP is readable. If it is not,
+it suggests restarting with `sudo ./tnetview`; press `7` for details.
+If the operating system does not expose its ARP table to the process, the
+Gateway ARP check shows `N/A` and is excluded from the pass count. The ARP page
+(`7`) shows the entries and the result of the IPv4 route-table probe. Use
+`./tnetview --arp -vv` for a one-shot report with raw ARP diagnostics on stderr;
+`-v` prints a summary. In the interactive interface, redirect stderr to a file
+when using `-vv` to keep the display readable.
 
 ## Build prerequisites
 
@@ -97,6 +107,15 @@ Missing tools do not prevent the application from starting. Their associated
 checks may fail or be unavailable, and the Prerequisites page shows which tools
 were found and whether their harmless probe command succeeded.
 
+The Network Tree page optionally reads `lldpcli -f keyvalue show neighbors
+details` from a running `lldpd` daemon. LLDP must be enabled on the adjacent
+device and received by the local interface. It can identify an adjacent switch
+without an IP address and show its port. Ping and ARP discover IP/MAC identities
+but cannot reveal which switch port a device uses. Therefore the tree only draws
+direct links supported by LLDP; all other devices appear under **Link unknown**.
+Unmanaged switches that emit no discovery information cannot be identified from
+this computer alone. The page does not claim to map links between remote devices.
+
 Local-device discovery assumes an IPv4 `/24` network. ICMP filtering may hide
 devices that do not answer ping, although populated ARP entries are also used.
 
@@ -131,10 +150,29 @@ background combinations.
 | `3` | Known Devices |
 | `4` | Interfaces |
 | `5` | Prerequisites |
+| `6` | Network Tree |
+| `7` | ARP table and access diagnosis |
 | Up/Down or `k`/`j` | Select a device row |
+| Up/Down or `k`/`j` on Network Tree | Scroll the tree |
 | Space | Toggle whether the selected local device is known |
 | `n` | Edit the selected known device's user name |
 | `d` | Delete the selected known device |
 | `r` | Refresh the current page |
 | `t` | Show or hide the ANSI color matrix |
 | `q` or Ctrl-C | Exit |
+
+### ARP access on macOS 27
+
+On this Mac, `./tnetview --arp -vv` returns an empty IPv4 ARP table as a normal
+user, including when launched from Terminal. Running it with `sudo` exposes the
+entries:
+
+```sh
+sudo ./tnetview --arp -vv
+```
+
+To use MAC addresses in the interactive Local Devices and Network Tree pages,
+run `sudo ./tnetview`. This also makes the Known Devices database use root's
+home directory instead of your normal `~/.tnetview-known.tsv`. The program does
+not request elevated privileges automatically. Without readable ARP data, the
+Gateway ARP check is `N/A` and MAC-based device discovery is incomplete.
