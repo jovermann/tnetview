@@ -10,18 +10,17 @@ run in background workers.
 - Network diagnostics for interfaces, DHCP, the default route, gateway ARP,
   configured DNS servers, forward and reverse DNS, ICMP reachability, HTTPS,
   captive portals, traceroute, and possible DNS hijacking.
-- `/24` local-device discovery using parallel ICMP probes, the ARP cache, and
-  ARP packets captured during the sweep when packet capture is available.
+- Local-device discovery that shows cached ARP neighbors first, probes the
+  selected IPv4 `/24` with parallel ICMP, and reads ARP again after the sweep.
+  Captured ARP packets are included when packet capture is available.
 - IPv6 neighbor-cache and captured Neighbor Advertisement correlation by MAC
   address, including IPv6-only peers, and Bonjour service discovery.
-- Scrollable network tree with directly observed LLDP neighbors, including peers
-  without an IP address, and a separate branch for devices with unknown links.
 - Asynchronous host-name lookup through ARP, system DNS, local caches, mDNS,
   Avahi, and NetBIOS (where available), plus inspection of common TCP ports.
 - MAC vendor lookup using IEEE MA-L, MA-M, and MA-S assignments from
   `ouidb.txt`.
-- Persistent known devices with editable user names, stored by MAC address in
-  `~/.tnetview-known.tsv`.
+- Persistent known devices with editable user names, stored by MAC address or
+  by IP when no MAC is available, in `~/.tnetview-known.tsv`.
 - Interface and external-tool prerequisite pages.
 - Always-on ANSI foreground and background colors.
 - A non-interactive status report for scripts and diagnostics.
@@ -29,23 +28,27 @@ run in background workers.
 Page headers report `BUSY`, `SCANNING`, `INSPECTING`, or `IDLE`. Status tests
 show `...` until their individual results arrive. `q` and Ctrl-C remain
 responsive during network operations and restore the terminal before exiting.
-The bottom line of each main page shows whether ARP is readable. If it is not,
-it suggests restarting with `sudo ./tnetview`; press `7` for details.
+An ARP access line appears immediately below each page's table when ARP cannot
+be read or has no resolved neighbors. It suggests restarting with
+`sudo ./tnetview` when access fails; press `6` for details.
 If the operating system does not expose its ARP table to the process, the
 Gateway ARP check shows `N/A` and is excluded from the pass count. The ARP page
-(`7`) shows the entries and the result of the IPv4 route-table probe. Use
+(`6`) shows resolved entries and MAC vendors, marks multicast addresses, and
+hides incomplete probes. It also shows the result of the IPv4 route-table probe
+when ARP is unavailable. Use
 `./tnetview --arp -vv` for a one-shot report with raw ARP diagnostics on stderr;
 `-v` prints a summary. In the interactive interface, redirect stderr to a file
 when using `-vv` to keep the display readable.
 
-The Local Devices page shows capture availability and, for the selected device,
-IPv6 addresses, discovery evidence, open TCP ports, and advertised Bonjour
-services. `./tnetview --discover -v` prints a one-shot discovery report. A
+The Local Devices and Unknown Devices pages show capture availability and, for
+the selected device, IPv6 addresses, discovery evidence, open TCP ports, and
+advertised Bonjour services. Unknown Devices contains observed peers that are
+not marked known; Space marks a selected peer known, including one with no MAC.
+Local, Known, and Unknown Devices are sorted by numeric IP address.
+`./tnetview --discover -v` prints a one-shot discovery report. A
 missing permission or utility reduces available observations without stopping
-the scan. Press `p` on a selected local device for an optional Nmap deep probe
-of common TCP services and version hints; page `8` shows its output. The same
-probe is available as `./tnetview --deep 192.168.1.1`. It has a 20-second
-host timeout.
+the scan. Host names are looked up after discovery; common TCP ports are
+inspected last.
 
 ## Build prerequisites
 
@@ -93,7 +96,6 @@ On macOS, the following tools are expected:
 - `tcpdump` (optional packet capture; requires privilege)
 - `ndp` (optional IPv6 neighbor data)
 - `dns-sd` (optional Bonjour discovery)
-- `nmap` (optional on-demand service/version probe)
 - `dscacheutil`
 - `scutil`
 - `route`
@@ -123,17 +125,13 @@ Missing tools do not prevent the application from starting. Their associated
 checks may fail or be unavailable, and the Prerequisites page shows which tools
 were found and whether their harmless probe command succeeded.
 
-The Network Tree page optionally reads `lldpcli -f keyvalue show neighbors
-details` from a running `lldpd` daemon. LLDP must be enabled on the adjacent
-device and received by the local interface. It can identify an adjacent switch
-without an IP address and show its port. Ping and ARP discover IP/MAC identities
-but cannot reveal which switch port a device uses. Therefore the tree only draws
-direct links supported by LLDP; all other devices appear under **Link unknown**.
-Unmanaged switches that emit no discovery information cannot be identified from
-this computer alone. The page does not claim to map links between remote devices.
+The `--discover` report optionally includes neighbors reported by a running
+`lldpd` daemon. Switches that emit no discovery information cannot be
+identified from this computer alone.
 
-Local-device discovery assumes an IPv4 `/24` network. ICMP filtering may hide
-devices that do not answer ping, although populated ARP entries are also used.
+The active ICMP sweep assumes an IPv4 `/24` network. All resolved entries in
+the ARP cache are shown, including neighbors outside that range. ICMP filtering
+may hide devices that are absent from the cache and do not answer ping.
 
 ## Running
 
@@ -164,15 +162,13 @@ background combinations.
 | `1` | Network Status |
 | `2` | Local Devices |
 | `3` | Known Devices |
-| `4` | Interfaces |
-| `5` | Prerequisites |
-| `6` | Network Tree |
-| `7` | ARP table and access diagnosis |
-| `8` | Last deep probe result |
-| `p` on Local Devices | Deep probe the selected device |
+| `4` | Unknown Devices |
+| `5` | Interfaces |
+| `6` | Resolved ARP entries, MAC vendors, and access diagnosis |
+| `7` | Prerequisites and tools |
 | Up/Down or `k`/`j` | Select a device row |
-| Up/Down or `k`/`j` on Network Tree | Scroll the tree |
-| Space | Toggle whether the selected local device is known |
+| Up/Down or `k`/`j` on ARP | Scroll the ARP table |
+| Space | Toggle whether the selected local or unknown device is known |
 | `n` | Edit the selected known device's user name |
 | `d` | Delete the selected known device |
 | `r` | Refresh the current page |
@@ -189,7 +185,7 @@ entries:
 sudo ./tnetview --arp -vv
 ```
 
-To use MAC addresses in the interactive Local Devices and Network Tree pages,
+To use MAC addresses in the interactive Local Devices and ARP pages,
 run `sudo ./tnetview`. This also makes the Known Devices database use root's
 home directory instead of your normal `~/.tnetview-known.tsv`. The program does
 not request elevated privileges automatically. Without readable ARP data, the
@@ -198,7 +194,7 @@ new packet capture source also requires privilege on macOS; the scan continues
 using its other sources without it. To inspect all available local sources at
 once, run `sudo ./tnetview --discover -v`.
 
-Discovery remains limited to the local link and the IPv4 `/24` chosen by the
+Active discovery remains limited to the local link and the IPv4 `/24` chosen by the
 current scanner. A packet trace on this Mac cannot reveal every conversation
 between devices elsewhere on a switched network. Router DHCP leases, Wi-Fi
 client lists, and managed-switch forwarding tables require access to those

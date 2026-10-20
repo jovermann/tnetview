@@ -28,6 +28,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <optional>
+#include <poll.h>
 #include <regex>
 #include <set>
 #include <signal.h>
@@ -163,27 +164,21 @@ struct AppState
     std::vector<Result>       status;
     std::vector<Device>       devices;
     ArpSnapshot               arp;
-    std::vector<LldpNeighbor> neighbors;
     std::vector<Prerequisite> prereqs;
     std::vector<Interface>    ifaces;
     std::string               captureDiagnostic;
-    std::string               deepIp;
-    std::string               deepOutput;
     std::string               gatewayAddress;
     std::vector<std::string>  dnsAddresses;
     bool                      statusBusy {}, devicesBusy {}, prereqBusy {};
     bool                      devicesEnrichBusy {};
-    bool                      lldpBusy {};
     bool                      arpBusy {};
     bool                      interfaceBusy {};
-    bool                      deepBusy {};
     size_t                    statusDone {}, statusTotal { 17 };
     unsigned                  devicesDone {}, devicesTotal { 254 };
     unsigned                  devicesEnrichDone {}, devicesEnrichTotal {};
     uint64_t                  statusGeneration {}, devicesGeneration {}, prereqGeneration {};
     uint64_t                  interfaceGeneration {};
     uint64_t                  arpGeneration {};
-    uint64_t                  deepGeneration {};
 };
 
 /// Requested diagnostic detail level: 0 quiet, 1 summary, 2 raw ARP data.
@@ -191,6 +186,10 @@ static unsigned verboseLevel {};
 
 /// Prevent concurrent network workers from interleaving diagnostic lines.
 static std::mutex debugMutex;
+
+/// ARP access message shown directly after the current page's table.
+/// Only the interactive rendering thread reads or writes this value.
+static std::string menuArpStatus;
 
 /// Emit a diagnostic line when the requested verbosity includes its level.
 static void debugLog(unsigned level, const std::string& message)
@@ -581,6 +580,14 @@ static std::vector<LldpNeighbor> lldpNeighbors()
     return result;
 }
 
+/// Identify IPv4 multicast destinations from their network-order address.
+static bool isMulticastIpv4(const std::string& ip)
+{
+    in_addr address {};
+    return inet_pton(AF_INET, ip.c_str(), &address) == 1
+        && (ntohl(address.s_addr) & 0xF0000000u) == 0xE0000000u;
+}
+
 /// Read and parse the neighbor cache while retaining unresolved ARP rows.
 static ArpSnapshot readArpSnapshot()
 {
@@ -594,7 +601,9 @@ static ArpSnapshot readArpSnapshot()
         if (std::regex_match(line, match, pattern))
         {
             auto mac = formatMac(match[2]);
-            snapshot.entries.push_back({ match[1], mac, match[3], mac.empty() ? "incomplete" : "resolved" });
+            auto ip = match[1].str();
+            snapshot.entries.push_back({ ip, mac, match[3], mac.empty() ? "incomplete"
+                : (isMulticastIpv4(ip) ? "multicast" : "resolved") });
         }
     if (snapshot.raw.empty())
     {
@@ -914,10 +923,41 @@ static std::string vendorForMac(const std::string& mac)
     return "unknown vendor";
 }
 
-/// Return whether a short TCP connection to ip:port succeeds.
+/// Probe a numeric IPv4 or IPv6 address with a bounded TCP connection.
 static bool portOpen(const std::string& ip, int port)
 {
-    return connectCheck("", ip, port, 200).ok;
+    addrinfo hints {};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
+    addrinfo* info {};
+    auto service = std::to_string(port);
+    if (getaddrinfo(ip.c_str(), service.c_str(), &hints, &info) != 0)
+        return false;
+    bool connected = false;
+    for (auto* address = info; address && !connected; address = address->ai_next)
+    {
+        int fd = socket(address->ai_family, SOCK_STREAM, 0);
+        if (fd < 0)
+            continue;
+        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+        int result = connect(fd, address->ai_addr, address->ai_addrlen);
+        if (result == 0)
+            connected = true;
+        else if (errno == EINPROGRESS)
+        {
+            pollfd ready { fd, POLLOUT, 0 };
+            if (poll(&ready, 1, 200) > 0)
+            {
+                int error {};
+                socklen_t length = sizeof(error);
+                connected = getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) == 0 && error == 0;
+            }
+        }
+        close(fd);
+    }
+    freeaddrinfo(info);
+    return connected;
 }
 
 /// Return the last octet of an IPv4 address for natural subnet ordering.
@@ -932,6 +972,30 @@ static unsigned ipLast(const std::string& ip)
     {
         return 0;
     }
+}
+
+/// Sort numeric IPv4 and IPv6 addresses by their full network-order bytes.
+static bool ipLess(const std::string& left, const std::string& right)
+{
+    in_addr left4 {}, right4 {};
+    const bool isLeft4 = inet_pton(AF_INET, left.c_str(), &left4) == 1;
+    const bool isRight4 = inet_pton(AF_INET, right.c_str(), &right4) == 1;
+    if (isLeft4 != isRight4)
+        return isLeft4;
+    if (isLeft4)
+        return std::memcmp(&left4, &right4, sizeof(left4)) < 0;
+    in6_addr left6 {}, right6 {};
+    const bool isLeft6 = inet_pton(AF_INET6, left.substr(0, left.find('%')).c_str(), &left6) == 1;
+    const bool isRight6 = inet_pton(AF_INET6, right.substr(0, right.find('%')).c_str(), &right6) == 1;
+    if (isLeft6 != isRight6)
+        return isLeft6;
+    if (isLeft6)
+    {
+        int order = std::memcmp(&left6, &right6, sizeof(left6));
+        if (order != 0)
+            return order < 0;
+    }
+    return left < right;
 }
 
 static void addEvidence(Device& device, const std::string& source)
@@ -971,13 +1035,31 @@ static std::vector<Device> scanDevices(const std::function<void(const Device&, u
     addEvidence(found[local], "local interface");
     if (update)
         update(found[local], 0, 254);
+    // Publish cached neighbors before launching the slower active sweep.
+    auto publishArpCache = [&](unsigned progress)
+    {
+        for (const auto& [ip, identity]: arpTable())
+        {
+            auto& device = found[ip];
+            device.ip = ip;
+            if (device.name.empty())
+                device.name = identity.first;
+            device.mac = identity.second;
+            device.vendor = vendorForMac(device.mac);
+            addEvidence(device, "ARP cache");
+            if (update)
+                update(device, progress, 254);
+        }
+    };
+    publishArpCache(0);
     auto gw = gateway();
     if (!gw.empty())
     {
-        found[gw] = { gw, {}, {}, {}, {}, false, {}, {}, {} };
-        addEvidence(found[gw], "default route");
+        auto& device = found[gw];
+        device.ip = gw;
+        addEvidence(device, "default route");
         if (update)
-            update(found[gw], 0, 254);
+            update(device, 0, 254);
     }
     auto captured = std::async(std::launch::async, captureArpReplies, localInterface);
     auto neighbors6 = std::async(std::launch::async, ipv6Neighbors, localInterface);
@@ -1000,11 +1082,13 @@ static std::vector<Device> scanDevices(const std::function<void(const Device&, u
                     auto count = scanned.fetch_add(1) + 1;
                     if (alive)
                     {
-                        Device copy { ip, {}, {}, {}, {}, false, {}, {}, {} };
-                        addEvidence(copy, "ping");
+                        Device copy;
                         {
                             std::lock_guard guard(lock);
-                            found.try_emplace(ip, copy);
+                            auto& device = found[ip];
+                            device.ip = ip;
+                            addEvidence(device, "ping");
+                            copy = device;
                         }
                         if (update)
                             update(copy, count, 254);
@@ -1025,24 +1109,12 @@ static std::vector<Device> scanDevices(const std::function<void(const Device&, u
         auto& device = found[reply.ip];
         device.ip = reply.ip;
         device.mac = reply.mac;
+        device.vendor = vendorForMac(device.mac);
         addEvidence(device, "ARP packet");
         if (update)
             update(device, 254, 254);
     }
-    for (const auto& [ip, identity]: arpTable())
-    {
-        if (ip.rfind(base, 0) == 0 && ipLast(ip) > 0 && ipLast(ip) < 255)
-        {
-            auto& d = found[ip];
-            d.ip    = ip;
-            if (d.name.empty())
-                d.name = identity.first;
-            d.mac = identity.second;
-            addEvidence(d, "ARP cache");
-            if (update)
-                update(d, 254, 254);
-        }
-    }
+    publishArpCache(254);
     for (const auto& service: bonjour.get())
     {
         if (service.ip.rfind(base, 0) != 0 || ipLast(service.ip) == 0 || ipLast(service.ip) == 255)
@@ -1100,6 +1172,7 @@ static std::vector<Device> scanDevices(const std::function<void(const Device&, u
             Device device;
             device.ip = addresses.front();
             device.mac = mac;
+            device.vendor = vendorForMac(device.mac);
             for (const auto& address: addresses)
             {
                 if (!device.ipv6.empty())
@@ -1118,7 +1191,7 @@ static std::vector<Device> scanDevices(const std::function<void(const Device&, u
     std::sort(out.begin(), out.end(),
         [](const auto& a, const auto& b)
         {
-            return ipLast(a.ip) < ipLast(b.ip);
+            return ipLess(a.ip, b.ip);
         });
     return out;
 }
@@ -1129,6 +1202,24 @@ static std::string knownPath()
     const char* home = std::getenv("HOME");
     return home ? std::string(home) + "/.tnetview-known.tsv" : ".tnetview-known.tsv";
 }
+/// Accept a numeric IPv4 or IPv6 address, including an IPv6 interface zone.
+static bool validIpAddress(const std::string& ip)
+{
+    in_addr address4 {};
+    in6_addr address6 {};
+    if (inet_pton(AF_INET, ip.c_str(), &address4) == 1)
+        return true;
+    return inet_pton(AF_INET6, ip.substr(0, ip.find('%')).c_str(), &address6) == 1;
+}
+
+/// Prefer a stable MAC match, falling back to IP when either MAC is absent.
+static bool matchesKnown(const Device& device, const KnownDevice& known)
+{
+    if (!device.mac.empty() && !known.mac.empty())
+        return device.mac == known.mac;
+    return !known.ip.empty() && device.ip == known.ip;
+}
+
 /// Load valid known-device records from the tab-separated database.
 static std::vector<KnownDevice> loadKnown()
 {
@@ -1142,13 +1233,18 @@ static std::vector<KnownDevice> loadKnown()
         std::string              v;
         while (std::getline(row, v, '\t'))
             f.push_back(v);
-        if (f.size() >= 5)
+        if (f.size() >= 4)
         {
             auto mac = formatMac(f[0]);
-            if (!mac.empty())
-                out.push_back({ mac, f[1], f[2], f[3], f[4] });
+            if (!mac.empty() || validIpAddress(f[3]))
+                out.push_back({ mac, f[1], f[2], f[3], f.size() > 4 ? f[4] : "" });
         }
     }
+    std::sort(out.begin(), out.end(),
+        [](const auto& a, const auto& b)
+        {
+            return ipLess(a.ip, b.ip);
+        });
     return out;
 }
 /// Rewrite the known-device database from the current in-memory records.
@@ -1158,12 +1254,12 @@ static void saveKnown(const std::vector<KnownDevice>& rows)
     for (const auto& r: rows)
         out << r.mac << '\t' << r.userName << '\t' << r.dns << '\t' << r.ip << '\t' << r.vendor << '\n';
 }
-/// Merge persisted names and current discovery data by MAC address.
+/// Merge persisted names and current discovery data by MAC or, if absent, IP.
 static void applyKnown(std::vector<Device>& devices, std::vector<KnownDevice>& known)
 {
     for (auto& d: devices)
         for (auto& k: known)
-            if (!d.mac.empty() && d.mac == k.mac)
+            if (matchesKnown(d, k))
             {
                 d.known  = true;
                 k.ip     = d.ip;
@@ -1172,6 +1268,27 @@ static void applyKnown(std::vector<Device>& devices, std::vector<KnownDevice>& k
                 if (!k.userName.empty())
                     d.name = k.userName;
             }
+}
+
+/// Keep only peers observed by discovery sources that are not marked known.
+static std::vector<Device> unknownDevices(const std::vector<Device>& devices)
+{
+    std::vector<Device> result;
+    for (const auto& device: devices)
+        if (!device.known && !device.ip.empty()
+            && device.evidence.find("local interface") == std::string::npos
+            && (device.evidence.find("ping") != std::string::npos
+                || device.evidence.find("ARP") != std::string::npos
+                || device.evidence.find("Bonjour") != std::string::npos
+                || device.evidence.find("IPv6") != std::string::npos
+                || !device.ports.empty()))
+            result.push_back(device);
+    std::sort(result.begin(), result.end(),
+        [](const auto& a, const auto& b)
+        {
+            return ipLess(a.ip, b.ip);
+        });
+    return result;
 }
 
 /// Return human-readable DHCP lease information when supported by the OS.
@@ -1607,11 +1724,23 @@ static std::string pad(std::string s, size_t n)
         s += std::string(n - s.size(), ' ');
     return s;
 }
+/// Give every table heading a full-width background matching its data area.
+static void printTableHeader(const std::string& columns, size_t width, bool color)
+{
+    std::cout << (color ? ut1::tui::ansiBlackOnCyan : "") << pad(columns, width)
+              << (color ? ut1::tui::ansiReset : "") << '\n';
+}
+/// Ordered keyboard tabs; Tools stays last because it is a diagnostic page.
+static constexpr const char* menuTabs = "1 Status 2 Local 3 Known 4 Unknown 5 Ifaces 6 ARP 7 Tools";
 /// Render the full-width menu bar and its green keyboard-help line.
 static void printMenu(const std::string& text, const std::string& help, size_t width, bool color)
 {
-    std::cout << "\n"
-              << (color ? ut1::tui::ansiWhiteOnBlue : "") << pad(text, width) << (color ? ut1::tui::ansiReset : "")
+    const char* statusColor = menuArpStatus.find("unavailable") != std::string::npos
+        ? ut1::tui::ansiBrightRed : ut1::tui::ansiBrightYellow;
+    if (!menuArpStatus.empty())
+        std::cout << (color ? statusColor : "") << ut1::tui::fitTerminalLine("  " + menuArpStatus, width)
+                  << (color ? ut1::tui::ansiReset : "") << '\n';
+    std::cout << (color ? ut1::tui::ansiWhiteOnBlue : "") << pad(text, width) << (color ? ut1::tui::ansiReset : "")
               << "\n"
               << (color ? ut1::tui::ansiBrightGreen : "") << help << (color ? ut1::tui::ansiReset : "") << "\n"
               << std::flush;
@@ -1660,8 +1789,8 @@ static void renderStatus(
               << c(ansiReset) << "\n";
     std::cout << c(summary == "Internet access OK" ? ansiBrightGreen : ansiBrightYellow) << "  " << summary << "  —  "
               << ok << "/" << (busy ? rows.size() : applicable) << " checks passed" << c(ansiReset) << "\n\n";
-    std::cout << c(ansiBold) << "  " << pad("STATUS", 9) << pad("TEST", 25) << pad("IP", 18) << pad("PING", 10)
-              << "DETAILS" << c(ansiReset) << "\n";
+    printTableHeader("  " + pad("STATUS", 9) + pad("TEST", 25) + pad("IP", 18) + pad("PING", 10)
+        + "DETAILS", width, color);
     for (const auto& r: rows)
     {
         const char* state = !r.ready || !r.available ? ansiGray : (r.ok ? ansiBrightGreen : ansiBrightRed);
@@ -1670,7 +1799,7 @@ static void renderStatus(
         std::cout << c(state) << fitTerminalLine(line, width) << c(ansiReset) << "\n";
     }
     if (fullScreen)
-        printMenu(" 1 Status   2 Local   3 Known   4 Interfaces   5 Tools   6 Tree   7 ARP   8 Probe",
+        printMenu(menuTabs,
             "  r Refresh   t Colors   q Quit", width, color);
 }
 /// Render local interfaces and asynchronously queried resolver/routing data.
@@ -1687,17 +1816,19 @@ static void renderInterfaces(const std::vector<Interface>& rows, const std::stri
     std::cout << c(ansiWhiteOnBlue)
               << pad(" tnetview  INTERFACES  [" + std::string(busy ? "BUSY" : "IDLE") + "]",
                      std::max<size_t>(30, width))
-              << c(ansiReset) << "\n\n"
-              << c(ansiBold) << "  " << pad("INTERFACE", 18) << pad("IPv4 ADDRESS", 20) << "NETMASK" << c(ansiReset)
-              << "\n";
+              << c(ansiReset) << "\n\n";
+    printTableHeader("  " + pad("INTERFACE", 18) + pad("IPv4 ADDRESS", 20) + "NETMASK", width, color);
     for (const auto& i: rows)
-        std::cout << c(i.address == "127.0.0.1" ? ansiGray : ansiBrightGreen) << "  " << pad(i.name, 18)
-                  << pad(i.address, 20) << i.mask << c(ansiReset) << "\n";
-    std::cout << c(ansiBrightGreen) << "\n  Default gateway: " << gatewayAddress << "\n  DNS servers: ";
+        std::cout << c(i.address == "127.0.0.1" ? ansiGray : ansiBrightGreen)
+                  << fitTerminalLine("  " + pad(i.name, 18) + pad(i.address, 20) + i.mask, width)
+                  << c(ansiReset) << "\n";
+    std::string dnsLine = "  DNS servers: ";
     for (const auto& s: dnsAddresses)
-        std::cout << s << ' ';
-    std::cout << c(ansiReset);
-    printMenu(" 1 Status   2 Local   3 Known   4 Interfaces   5 Tools   6 Tree   7 ARP   8 Probe",
+        dnsLine += s + " ";
+    std::cout << c(ansiBrightGreen) << '\n'
+              << fitTerminalLine("  Default gateway: " + gatewayAddress, width) << '\n'
+              << fitTerminalLine(dnsLine, width) << c(ansiReset) << '\n';
+    printMenu(menuTabs,
         "  r Refresh   t Colors   q Quit", width, color);
 }
 
@@ -1722,20 +1853,21 @@ static void renderPrerequisites(const std::vector<Prerequisite>& rows, bool busy
               << (busy ? "Checking tools..."
                        : std::to_string(ok) + "/" + std::to_string(rows.size()) + " tools available and working")
               << c(ansiReset) << "\n\n";
-    std::cout << c(ansiBold) << "  " << pad("STATUS", 9) << pad("TOOL", 20) << "PATH" << c(ansiReset) << "\n";
+    printTableHeader("  " + pad("STATUS", 9) + pad("TOOL", 20) + "PATH", width, color);
     for (const auto& r: rows)
         std::cout << c(r.ok ? ansiBrightGreen : ansiBrightRed)
                   << fitTerminalLine("  " + pad(r.ok ? "PASS" : "FAIL", 9) + pad(r.tool, 20)
                              + (r.path.empty() ? "not found" : r.path),
                          width)
                   << c(ansiReset) << "\n";
-    printMenu(" 1 Status   2 Local   3 Known   4 Interfaces   5 Tools   6 Tree   7 ARP   8 Probe",
+    printMenu(menuTabs,
         "  r Refresh   t Colors   q Quit", width, color);
 }
 
 /// Render discovered devices and discovery/inspection progress.
 static void renderDevices(const std::vector<Device>& rows, size_t selected, bool busy, unsigned done, unsigned total,
-    bool enrichBusy, unsigned enrichDone, unsigned enrichTotal, const std::string& captureDiagnostic, bool color)
+    bool enrichBusy, unsigned enrichDone, unsigned enrichTotal, const std::string& captureDiagnostic,
+    bool unknownPage, bool color)
 {
     using namespace ut1::tui;
     clearScreen();
@@ -1748,23 +1880,34 @@ static void renderDevices(const std::vector<Device>& rows, size_t selected, bool
         ? "SCANNING " + std::to_string(done) + "/" + std::to_string(total)
         : (enrichBusy ? "INSPECTING " + std::to_string(enrichDone) + "/" + std::to_string(enrichTotal) : "IDLE");
     std::cout << c(ansiWhiteOnBlue)
-              << pad(" tnetview  LOCAL DEVICES (" + std::to_string(rows.size()) + ")  [" + progress + "]",
+              << pad(" tnetview  " + std::string(unknownPage ? "UNKNOWN DEVICES" : "LOCAL DEVICES")
+                      + " (" + std::to_string(rows.size()) + ")  [" + progress + "]",
                      std::max<size_t>(30, width))
               << c(ansiReset) << "\n\n";
     std::cout << c(ansiBrightYellow)
               << fitTerminalLine("  " + (captureDiagnostic.empty() ? "packet capture: checking..." : captureDiagnostic), width)
               << c(ansiReset) << "\n";
-    std::cout << c(ansiBold) << "  " << pad("IP ADDRESS", 16) << pad("WEB", 6) << pad("KNOWN", 8) << pad("NAME", 32)
-              << pad("MAC", 19) << pad("MAC VENDOR", 32) << "PORTS" << c(ansiReset) << "\n";
+    if (unknownPage)
+        printTableHeader("  " + pad("IP ADDRESS", 23) + pad("NAME", 24) + pad("MAC", 19)
+            + pad("VENDOR", 40) + "PORTS", width, color);
+    else
+        printTableHeader("  " + pad("IP ADDRESS", 16) + pad("WEB", 6) + pad("KNOWN", 8) + pad("NAME", 24)
+            + pad("MAC", 19) + pad("MAC VENDOR", 40) + "PORTS", width, color);
     size_t visible = terminalHeight() > 13 ? terminalHeight() - 13 : 1;
-    size_t first = selected >= visible ? selected - visible + 1 : 0;
+    size_t first = rows.size() <= visible ? 0
+        : std::min(selected >= visible ? selected - visible + 1 : 0, rows.size() - visible);
     for (size_t i = first; i < rows.size() && i < first + visible; ++i)
     {
         const auto& r    = rows[i];
-        std::string line = (i == selected ? "> " : "  ") + pad(r.ip, 16)
-            + pad((r.ports.find("80") != std::string::npos || r.ports.find("443") != std::string::npos) ? "yes" : "", 6)
-            + pad(r.known ? "[x]" : "[ ]", 8) + pad(safeTopologyLabel(r.name), 32) + pad(r.mac, 19)
-            + pad(r.vendor, 32) + r.ports;
+        std::string line;
+        if (unknownPage)
+            line = (i == selected ? "> " : "  ") + pad(r.ip, 23) + pad(safeTopologyLabel(r.name), 24)
+                + pad(r.mac, 19) + pad(r.vendor, 40) + r.ports;
+        else
+            line = (i == selected ? "> " : "  ") + pad(r.ip, 16)
+                + pad((r.ports.find("80") != std::string::npos || r.ports.find("443") != std::string::npos) ? "yes" : "", 6)
+                + pad(r.known ? "[x]" : "[ ]", 8) + pad(safeTopologyLabel(r.name), 24) + pad(r.mac, 19)
+                + pad(r.vendor, 40) + r.ports;
         std::cout << c(i == selected ? ansiBlackOnCyan : ansiBrightGreen) << fitTerminalLine(line, width)
                   << c(ansiReset) << "\n";
     }
@@ -1781,8 +1924,9 @@ static void renderDevices(const std::vector<Device>& rows, size_t selected, bool
                   << fitTerminalLine("  Advertised services: "
                       + (d.services.empty() ? "none observed" : safeTopologyLabel(d.services)), width) << "\n";
     }
-    printMenu(" 1 Status   2 Local   3 Known   4 Interfaces   5 Tools   6 Tree   7 ARP   8 Probe",
-        "  Up/Down Select   p Deep probe   Space Toggle known   r Rescan   q Quit", width, color);
+    printMenu(menuTabs,
+        unknownPage ? "  Up/Down Select   Space Mark known   r Rescan   q Quit"
+                    : "  Up/Down Select   Space Toggle known   r Rescan   q Quit", width, color);
 }
 
 /// Remove terminal control bytes from labels supplied by network peers and DNS.
@@ -1795,189 +1939,69 @@ static std::string safeTopologyLabel(const std::string& value)
     return out;
 }
 
-/// Build a tree containing only proven LLDP links and a separate unknown-link branch.
-static std::vector<std::string> topologyLines(const std::vector<Device>& devices,
-    const std::vector<LldpNeighbor>& neighbors, const std::vector<KnownDevice>& known,
-    const std::vector<Interface>& ifaces, const std::string& gw)
+/// Last useful scroll position; a short list always stays at the top.
+static size_t maxScroll(size_t rows, size_t visible)
 {
-    std::vector<std::string> lines { "Local network" };
-    std::string localIp;
-    for (const auto& iface: ifaces)
-        if (iface.address != "127.0.0.1" && !iface.address.empty())
-        {
-            localIp = iface.address;
-            break;
-        }
-    lines.push_back("+- This computer" + (localIp.empty() ? "" : " (" + localIp + ")"));
-    std::vector<std::string> linkedMacs;
-    for (const auto& neighbor: neighbors)
-    {
-        const Device* match = nullptr;
-        for (const auto& device: devices)
-            if (!neighbor.chassisMac.empty() && device.mac == neighbor.chassisMac)
-            {
-                match = &device;
-                break;
-            }
-        std::string name = neighbor.name;
-        for (const auto& item: known)
-            if (item.mac == neighbor.chassisMac && !item.userName.empty())
-                name = item.userName;
-        if (name.empty() && match && !match->name.empty())
-            name = match->name;
-        if (name.empty())
-            name = neighbor.chassisMac.empty() ? "LLDP neighbor" : neighbor.chassisMac;
-        std::string detail = neighbor.capability.empty() ? "device" : neighbor.capability;
-        if (match && !match->ip.empty())
-            detail += ", " + match->ip;
-        else if (!neighbor.chassisMac.empty())
-            detail += ", " + neighbor.chassisMac;
-        lines.push_back("|  +- " + safeTopologyLabel(neighbor.interfaceName) + " -> " + safeTopologyLabel(name)
-            + " [" + detail + ", LLDP]"
-            + (neighbor.remotePort.empty() ? "" : " port " + safeTopologyLabel(neighbor.remotePort)));
-        if (!neighbor.chassisMac.empty())
-            linkedMacs.push_back(neighbor.chassisMac);
-    }
-    if (neighbors.empty())
-        lines.push_back("|  +- No LLDP neighbor reported");
-    lines.push_back("+- Link unknown (Ping/ARP)");
-    size_t count = 0;
-    for (const auto& device: devices)
-    {
-        if (device.ip == localIp || (!device.mac.empty()
-            && std::find(linkedMacs.begin(), linkedMacs.end(), device.mac) != linkedMacs.end()))
-            continue;
-        std::string name = device.name;
-        for (const auto& item: known)
-            if (!device.mac.empty() && item.mac == device.mac && !item.userName.empty())
-                name = item.userName;
-        std::string label = device.ip == gw ? "gateway" : "device";
-        lines.push_back("   +- " + label + " " + safeTopologyLabel(device.ip)
-            + (name.empty() ? "" : " " + safeTopologyLabel(name))
-            + (device.mac.empty() ? "" : " [" + device.mac + "]"));
-        ++count;
-    }
-    if (!count)
-        lines.push_back("   +- No other device found yet");
-    return lines;
+    return rows > visible ? rows - visible : 0;
 }
 
-/// Render the scrollable network tree with its evidence and discovery status.
-static void renderTopology(const std::vector<std::string>& lines, size_t scroll, bool busy,
-    bool lldpBusy, bool color)
+/// Return only rows with a resolved MAC; incomplete ARP probes are not devices.
+static std::vector<const ArpEntry*> resolvedArpEntries(const ArpSnapshot& snapshot)
 {
-    using namespace ut1::tui;
-    clearScreen();
-    auto width = terminalWidth();
-    std::cout << (color ? ansiWhiteOnBlue : "")
-              << pad(" tnetview  NETWORK TREE  [" + std::string(busy || lldpBusy ? "SCANNING" : "IDLE") + "]",
-                     std::max<size_t>(30, width))
-              << (color ? ansiReset : "") << "\n";
-    std::cout << (color ? ansiBrightYellow : "")
-              << fitTerminalLine("  Solid links: local LLDP only. Other devices: physical link unknown.", width)
-              << (color ? ansiReset : "") << "\n\n";
-    size_t visible = terminalHeight() > 8 ? terminalHeight() - 8 : 1;
-    for (size_t i = scroll; i < lines.size() && i < scroll + visible; ++i)
-        std::cout << (color ? ansiBrightGreen : "") << fitTerminalLine("  " + lines[i], width)
-                  << (color ? ansiReset : "") << "\n";
-    printMenu(" 1 Status   2 Local   3 Known   4 Interfaces   5 Tools   6 Tree   7 ARP   8 Probe",
-        "  Up/Down Scroll   r Rescan   t Colors   q Quit", width, color);
+    std::vector<const ArpEntry*> result;
+    for (const auto& entry: snapshot.entries)
+        if (!entry.mac.empty())
+            result.push_back(&entry);
+    return result;
 }
 
-/// Render a scrollable view of the raw ARP table and access diagnosis.
+/// Summarize ARP access for the inline line beneath each page's table.
+static std::string arpAccessStatus(const ArpSnapshot& snapshot, bool busy)
+{
+    if (busy)
+        return "ARP: checking...";
+    if (snapshot.raw.empty())
+        return geteuid() == 0 ? "ARP: unavailable - see tab 6 for details"
+                                : "ARP: unavailable - restart with sudo ./tnetview";
+    return resolvedArpEntries(snapshot).empty() ? "ARP: no resolved neighbors" : "";
+}
+
+/// Number of ARP rows that fit without covering the footer.
+static size_t arpVisibleRows()
+{
+    return ut1::tui::terminalHeight() > 6 ? ut1::tui::terminalHeight() - 6 : 1;
+}
+
+/// Render a scrollable view of resolved ARP entries and access diagnosis.
 static void renderArp(const ArpSnapshot& snapshot, const std::string& gw, size_t scroll, bool busy, bool color)
 {
     using namespace ut1::tui;
     clearScreen();
     auto width = terminalWidth();
+    auto entries = resolvedArpEntries(snapshot);
     std::cout << (color ? ansiWhiteOnBlue : "")
-              << pad(" tnetview  ARP (" + std::to_string(snapshot.entries.size()) + ")  ["
+              << pad(" tnetview  ARP (" + std::to_string(entries.size()) + ")  ["
                       + (busy ? "READING" : "IDLE") + "]", std::max<size_t>(30, width))
-              << (color ? ansiReset : "") << "\n";
-    std::cout << (color ? ansiBrightYellow : "")
-              << fitTerminalLine("  " + (busy ? "Reading arp -an..." : snapshot.diagnostic), width)
               << (color ? ansiReset : "") << "\n\n";
-    std::cout << (color ? ansiBold : "") << "  " << pad("IP ADDRESS", 18) << pad("MAC ADDRESS", 20)
-              << pad("INTERFACE", 14) << "STATE" << (color ? ansiReset : "") << "\n";
-    size_t visible = terminalHeight() > 9 ? terminalHeight() - 9 : 1;
-    for (size_t i = scroll; i < snapshot.entries.size() && i < scroll + visible; ++i)
+    printTableHeader("  " + pad("IP ADDRESS", 18) + pad("MAC ADDRESS", 20)
+        + pad("MAC VENDOR", 32) + pad("INTERFACE", 14) + "STATE", width, color);
+    size_t visible = arpVisibleRows();
+    scroll = std::min(scroll, maxScroll(entries.size(), visible));
+    for (size_t i = scroll; i < entries.size() && i < scroll + visible; ++i)
     {
-        const auto& row = snapshot.entries[i];
-        auto line = "  " + pad(row.ip, 18) + pad(row.mac, 20) + pad(row.interfaceName, 14)
+        const auto& row = *entries[i];
+        auto line = "  " + pad(row.ip, 18) + pad(row.mac, 20) + pad(vendorForMac(row.mac), 32)
+            + pad(row.interfaceName, 14)
             + (row.ip == gw ? "gateway, " : "") + row.state;
-        std::cout << (color ? (row.mac.empty() ? ansiGray : ansiBrightGreen) : "")
+        std::cout << (color ? ansiBrightGreen : "")
                   << fitTerminalLine(line, width) << (color ? ansiReset : "") << "\n";
     }
-    printMenu(" 1 Status   2 Local   3 Known   4 Interfaces   5 Tools   6 Tree   7 ARP   8 Probe",
+    if (entries.empty())
+        std::cout << "  No resolved ARP neighbors to display.\n";
+    if (!busy && snapshot.raw.empty())
+        std::cout << fitTerminalLine("  " + snapshot.diagnostic, width) << '\n';
+    printMenu(menuTabs,
         "  Up/Down Scroll   r Refresh   q Quit", width, color);
-}
-
-static size_t deepLineCount(const std::string& output)
-{
-    return static_cast<size_t>(std::count(output.begin(), output.end(), '\n')) + (!output.empty() && output.back() != '\n');
-}
-
-static void renderDeepProbe(const std::string& ip, const std::string& output, size_t scroll, bool busy, bool color)
-{
-    using namespace ut1::tui;
-    clearScreen();
-    auto width = terminalWidth();
-    std::cout << (color ? ansiWhiteOnBlue : "")
-              << pad(" tnetview  DEEP PROBE " + ip + " [" + (busy ? "SCANNING" : "IDLE") + "]",
-                     std::max<size_t>(30, width))
-              << (color ? ansiReset : "") << "\n\n";
-    if (busy)
-        std::cout << "  Scanning common TCP ports and service versions (up to 20 seconds)...\n";
-    else
-    {
-        std::istringstream in(output);
-        std::string line;
-        size_t index = 0;
-        size_t visible = terminalHeight() > 7 ? terminalHeight() - 7 : 1;
-        while (std::getline(in, line))
-        {
-            if (index >= scroll && index < scroll + visible)
-                std::cout << fitTerminalLine("  " + line, width) << '\n';
-            ++index;
-        }
-    }
-    printMenu(" 1 Status   2 Local   3 Known   4 Interfaces   5 Tools   6 Tree   7 ARP   8 Probe",
-        "  Up/Down Scroll   p Probe selected device on Local page   q Quit", width, color);
-}
-
-/// Keep ARP availability visible on the terminal's last row on every main page.
-static void renderArpFooter(const ArpSnapshot& snapshot, bool busy, bool color)
-{
-    using namespace ut1::tui;
-    std::string message;
-    const char* shade = ansiBrightYellow;
-    if (busy)
-        message = " ARP: checking...";
-    else if (snapshot.raw.empty())
-    {
-        message = geteuid() == 0 ? " ARP: unavailable (see 7 for details)"
-                                : " ARP: unavailable - restart with sudo ./tnetview";
-        shade = ansiBrightRed;
-    }
-    else if (snapshot.entries.empty())
-    {
-        message = " ARP: output unreadable - press 7 for details";
-        shade = ansiBrightRed;
-    }
-    else
-    {
-        size_t resolved = 0;
-        for (const auto& entry: snapshot.entries)
-            resolved += !entry.mac.empty();
-        message = " ARP: OK (" + std::to_string(resolved) + " resolved, "
-            + std::to_string(snapshot.entries.size() - resolved) + " incomplete)";
-        shade = ansiBrightGreen;
-    }
-    message += "   7 Details   q Quit";
-    auto width = terminalWidth();
-    std::cout << "\033[" << terminalHeight() << ";1H\033[2K"
-              << (color ? shade : "") << fitTerminalLine(message, width > 1 ? width - 1 : 1)
-              << (color ? ansiReset : "") << std::flush;
 }
 
 /// Print a one-shot ARP report for testing outside an interactive terminal.
@@ -1985,8 +2009,9 @@ static void printArpReport(const ArpSnapshot& snapshot)
 {
     std::cout << "ARP: " << snapshot.diagnostic << '\n';
     for (const auto& row: snapshot.entries)
-        std::cout << row.ip << '\t' << (row.mac.empty() ? "-" : row.mac) << '\t'
-                  << row.interfaceName << '\t' << row.state << '\n';
+        if (!row.mac.empty())
+            std::cout << row.ip << '\t' << row.mac << '\t'
+                      << row.interfaceName << '\t' << row.state << '\n';
 }
 
 /// Render persisted known devices and the current selection.
@@ -2003,17 +2028,20 @@ static void renderKnown(const std::vector<KnownDevice>& rows, size_t selected, b
               << pad(" tnetview  KNOWN DEVICES (" + std::to_string(rows.size()) + ")  [IDLE]",
                      std::max<size_t>(30, width))
               << c(ansiReset) << "\n\n";
-    std::cout << c(ansiBold) << "  " << pad("DEL", 6) << pad("IP", 16) << pad("USER NAME", 22) << pad("DNS", 24)
-              << pad("MAC", 19) << "VENDOR" << c(ansiReset) << "\n";
-    for (size_t i = 0; i < rows.size(); ++i)
+    printTableHeader("  " + pad("DEL", 6) + pad("IP", 16) + pad("USER NAME", 18) + pad("DNS", 18)
+        + pad("MAC", 19) + "VENDOR", width, color);
+    size_t visible = terminalHeight() > 6 ? terminalHeight() - 6 : 1;
+    size_t first = rows.size() <= visible ? 0
+        : std::min(selected >= visible ? selected - visible + 1 : 0, rows.size() - visible);
+    for (size_t i = first; i < rows.size() && i < first + visible; ++i)
     {
         const auto& r    = rows[i];
-        std::string line = (i == selected ? "> " : "  ") + pad("[d]", 6) + pad(r.ip, 16) + pad(r.userName, 22)
-            + pad(r.dns, 24) + pad(r.mac, 19) + r.vendor;
+        std::string line = (i == selected ? "> " : "  ") + pad("[d]", 6) + pad(r.ip, 16) + pad(r.userName, 18)
+            + pad(r.dns, 18) + pad(r.mac, 19) + r.vendor;
         std::cout << c(i == selected ? ansiBlackOnCyan : ansiBrightGreen) << fitTerminalLine(line, width)
                   << c(ansiReset) << "\n";
     }
-    printMenu(" 1 Status   2 Local   3 Known   4 Interfaces   5 Tools   6 Tree   7 ARP   8 Probe",
+    printMenu(menuTabs,
         "  Up/Down Select   n Rename   d Delete   t Colors   q Quit", width, color);
 }
 
@@ -2141,11 +2169,11 @@ static void mergeDevice(std::vector<Device>& rows, const Device& device)
     std::sort(rows.begin(), rows.end(),
         [](const auto& a, const auto& b)
         {
-            return ipLast(a.ip) < ipLast(b.ip);
+            return ipLess(a.ip, b.ip);
         });
 }
 
-/// Start background discovery followed by independent name and port inspection.
+/// Start background discovery, then name lookup, and finally TCP port inspection.
 static void startDeviceScan(const std::shared_ptr<AppState>& state)
 {
     uint64_t generation;
@@ -2153,26 +2181,12 @@ static void startDeviceScan(const std::shared_ptr<AppState>& state)
         std::lock_guard lock(state->mutex);
         generation = ++state->devicesGeneration;
         state->devices.clear();
-        state->neighbors.clear();
         state->captureDiagnostic.clear();
         state->devicesBusy       = true;
         state->devicesEnrichBusy = false;
-        state->lldpBusy          = true;
         state->devicesDone       = 0;
         state->devicesEnrichDone = 0;
     }
-    std::thread(
-        [state, generation]
-        {
-            auto neighbors = lldpNeighbors();
-            std::lock_guard lock(state->mutex);
-            if (generation == state->devicesGeneration)
-            {
-                state->neighbors = std::move(neighbors);
-                state->lldpBusy = false;
-            }
-        })
-        .detach();
     std::thread(
         [state, generation]
         {
@@ -2225,6 +2239,12 @@ static void startDeviceScan(const std::shared_ptr<AppState>& state)
                             it->name = update.name;
                         ++state->devicesEnrichDone;
                     }));
+            }
+            for (auto& job: jobs)
+                job.get();
+            jobs.clear();
+            for (const auto& device: rows)
+            {
                 jobs.push_back(std::async(std::launch::async,
                     [state, generation, device]
                     {
@@ -2237,7 +2257,6 @@ static void startDeviceScan(const std::shared_ptr<AppState>& state)
                                     update.ports += ",";
                                 update.ports += std::to_string(port);
                             }
-                        update.vendor = vendorForMac(update.mac);
                         std::lock_guard lock(state->mutex);
                         if (generation != state->devicesGeneration)
                             return;
@@ -2247,10 +2266,7 @@ static void startDeviceScan(const std::shared_ptr<AppState>& state)
                                 return d.ip == update.ip;
                             });
                         if (it != state->devices.end())
-                        {
-                            it->ports  = update.ports;
-                            it->vendor = update.vendor;
-                        }
+                            it->ports = update.ports;
                         ++state->devicesEnrichDone;
                     }));
             }
@@ -2338,53 +2354,6 @@ static void startArpScan(const std::shared_ptr<AppState>& state)
         .detach();
 }
 
-/// Probe one selected host's common TCP services and versions with an
-/// independently bounded optional Nmap process.
-static std::string deepProbe(const std::string& ip)
-{
-    in_addr address4 {};
-    in6_addr address6 {};
-    auto zone = ip.find('%');
-    auto bare = ip.substr(0, zone);
-    bool ipv6 = inet_pton(AF_INET6, bare.c_str(), &address6) == 1;
-    if (!ipv6 && inet_pton(AF_INET, ip.c_str(), &address4) != 1)
-        return "Invalid IP address";
-    std::vector<std::string> command { "nmap", "-Pn", "-sT", "-sV", "--version-light",
-        "--open", "--top-ports", "100", "--max-retries", "1", "--host-timeout", "20s" };
-    if (ipv6)
-        command.push_back("-6");
-    command.push_back(ip);
-    auto output = commandOutput(command, 22000, true);
-    if (output.empty())
-        return "Nmap unavailable or produced no output. Install nmap to run a deep probe.";
-    if (output.find("Strange read error") != std::string::npos
-        && output.find("Operation not permitted") != std::string::npos)
-        return "Nmap could not inspect this host: Operation not permitted. Try running tnetview with sudo.";
-    return output;
-}
-
-static void startDeepProbe(const std::shared_ptr<AppState>& state, const std::string& ip)
-{
-    uint64_t generation;
-    {
-        std::lock_guard lock(state->mutex);
-        generation = ++state->deepGeneration;
-        state->deepIp = ip;
-        state->deepOutput.clear();
-        state->deepBusy = true;
-    }
-    std::thread([state, generation, ip]
-        {
-            auto output = deepProbe(ip);
-            std::lock_guard lock(state->mutex);
-            if (generation == state->deepGeneration)
-            {
-                state->deepOutput = std::move(output);
-                state->deepBusy = false;
-            }
-        }).detach();
-}
-
 /// Parse options and run either a one-shot report or the interactive event loop.
 int main(int argc, char* argv[])
 try
@@ -2400,7 +2369,6 @@ try
     cl.addOption(0, "once", "Print the status page once and exit.");
     cl.addOption(0, "arp", "Print the ARP table and access diagnosis once, then exit.");
     cl.addOption(0, "discover", "Print one local discovery report, including evidence and services.");
-    cl.addOption(0, "deep", "Probe common TCP services and versions for one IP address.", "IP");
     cl.addOption(0, "colors", "Show all ANSI color combinations and exit.");
     cl.parse(argc, argv);
     verboseLevel = cl.getCount("verbose");
@@ -2438,14 +2406,6 @@ try
                       << neighbor.name << '\t' << neighbor.remotePort << '\t' << neighbor.capability << '\n';
         return 0;
     }
-    if (cl.isSet("deep"))
-    {
-        auto output = deepProbe(cl.getStr("deep"));
-        std::cout << output;
-        if (output.empty() || output.back() != '\n')
-            std::cout << '\n';
-        return 0;
-    }
     if (cl.isSet("once") || !isatty(STDIN_FILENO))
     {
         auto rows = runChecks(static_cast<int>(timeout), static_cast<int>(retries));
@@ -2470,14 +2430,12 @@ try
         std::vector<Result>       rows;
         std::vector<Device>       devices;
         ArpSnapshot               arp;
-        std::vector<LldpNeighbor> neighbors;
         std::vector<Prerequisite> prereqs;
         std::vector<Interface>    ifaces;
         std::string               gw;
         std::string               captureDiagnostic;
-        std::string               deepIp, deepOutput;
         std::vector<std::string>  dns;
-        bool                      statusBusy, devicesBusy, devicesEnrichBusy, lldpBusy, arpBusy, prereqBusy, interfaceBusy, deepBusy;
+        bool                      statusBusy, devicesBusy, devicesEnrichBusy, arpBusy, prereqBusy, interfaceBusy;
         size_t                    statusDone, statusTotal;
         unsigned                  devicesDone, devicesTotal, devicesEnrichDone, devicesEnrichTotal;
         {
@@ -2485,22 +2443,17 @@ try
             rows               = state->status;
             devices            = state->devices;
             arp                = state->arp;
-            neighbors          = state->neighbors;
             prereqs            = state->prereqs;
             ifaces             = state->ifaces;
             gw                 = state->gatewayAddress;
             captureDiagnostic  = state->captureDiagnostic;
-            deepIp             = state->deepIp;
-            deepOutput         = state->deepOutput;
             dns                = state->dnsAddresses;
             statusBusy         = state->statusBusy;
             devicesBusy        = state->devicesBusy;
             devicesEnrichBusy  = state->devicesEnrichBusy;
-            lldpBusy           = state->lldpBusy;
             arpBusy            = state->arpBusy;
             prereqBusy         = state->prereqBusy;
             interfaceBusy      = state->interfaceBusy;
-            deepBusy           = state->deepBusy;
             statusDone         = state->statusDone;
             statusTotal        = state->statusTotal;
             devicesDone        = state->devicesDone;
@@ -2509,28 +2462,35 @@ try
             devicesEnrichTotal = state->devicesEnrichTotal;
         }
         applyKnown(devices, known);
+        std::sort(known.begin(), known.end(),
+            [](const auto& a, const auto& b)
+            {
+                return ipLess(a.ip, b.ip);
+            });
+        auto unknown = unknownDevices(devices);
+        menuArpStatus = showColors ? "" : arpAccessStatus(arp, arpBusy);
+        if (page == 4 && selected >= unknown.size() && !unknown.empty())
+            selected = unknown.size() - 1;
+        if (page == 6)
+            selected = std::min(selected, maxScroll(resolvedArpEntries(arp).size(), arpVisibleRows()));
         if (showColors)
             renderColors();
         else if (page == 1)
             renderStatus(rows, statusBusy, statusDone, statusTotal, color, true);
         else if (page == 2)
             renderDevices(devices, selected, devicesBusy, devicesDone, devicesTotal, devicesEnrichBusy,
-                devicesEnrichDone, devicesEnrichTotal, captureDiagnostic, color);
+                devicesEnrichDone, devicesEnrichTotal, captureDiagnostic, false, color);
         else if (page == 3)
             renderKnown(known, selected, color);
         else if (page == 4)
-            renderInterfaces(ifaces, gw, dns, interfaceBusy, color);
+            renderDevices(unknown, selected, devicesBusy, devicesDone, devicesTotal, devicesEnrichBusy,
+                devicesEnrichDone, devicesEnrichTotal, captureDiagnostic, true, color);
         else if (page == 5)
-            renderPrerequisites(prereqs, prereqBusy, color);
+            renderInterfaces(ifaces, gw, dns, interfaceBusy, color);
         else if (page == 6)
-            renderTopology(topologyLines(devices, neighbors, known, ifaces, gw), selected,
-                devicesBusy || devicesEnrichBusy, lldpBusy, color);
-        else if (page == 7)
             renderArp(arp, gw, selected, arpBusy, color);
-        else
-            renderDeepProbe(deepIp, deepOutput, selected, deepBusy, color);
-        if (!showColors)
-            renderArpFooter(arp, arpBusy, color);
+        else if (page == 7)
+            renderPrerequisites(prereqs, prereqBusy, color);
         int key = ut1::tui::readKey(100);
         if (key == ut1::tui::keyUp)
             key = 'k';
@@ -2573,65 +2533,49 @@ try
             break;
         case '4':
             page       = 4;
-            showColors = false;
-            if (ifaces.empty() && !interfaceBusy)
-                startInterfaces(state);
-            break;
-        case '5':
-            page       = 5;
-            showColors = false;
-            if (prereqs.empty() && !prereqBusy)
-                startPrerequisites(state);
-            break;
-        case '6':
-            page       = 6;
             selected   = 0;
             showColors = false;
             if (devices.empty() && !devicesBusy)
                 startDeviceScan(state);
             break;
-        case '7':
-            page       = 7;
+        case '5':
+            page       = 5;
+            showColors = false;
+            if (ifaces.empty() && !interfaceBusy)
+                startInterfaces(state);
+            break;
+        case '6':
+            page       = 6;
             selected   = 0;
             showColors = false;
             startArpScan(state);
             break;
-        case '8':
-            page       = 8;
+        case '7':
+            page       = 7;
             selected   = 0;
             showColors = false;
+            if (prereqs.empty() && !prereqBusy)
+                startPrerequisites(state);
             break;
         case 'j':
-            if ((page == 2 && selected + 1 < devices.size()) || (page == 3 && selected + 1 < known.size()))
+            if ((page == 2 && selected + 1 < devices.size()) || (page == 3 && selected + 1 < known.size())
+                || (page == 4 && selected + 1 < unknown.size()))
                 ++selected;
-            else if (page == 6 && selected + 1 < topologyLines(devices, neighbors, known, ifaces, gw).size())
-                ++selected;
-            else if (page == 7 && selected + 1 < arp.entries.size())
-                ++selected;
-            else if (page == 8 && selected + 1 < deepLineCount(deepOutput))
+            else if (page == 6 && selected < maxScroll(resolvedArpEntries(arp).size(), arpVisibleRows()))
                 ++selected;
             break;
         case 'k':
-            if ((page == 2 || page == 3 || page == 6 || page == 7 || page == 8) && selected > 0)
+            if ((page == 2 || page == 3 || page == 4 || page == 6) && selected > 0)
                 --selected;
             break;
-        case 'p':
-        case 'P':
-            if (page == 2 && selected < devices.size())
-            {
-                startDeepProbe(state, devices[selected].ip);
-                page = 8;
-                selected = 0;
-            }
-            break;
         case ' ':
-            if (page == 2 && selected < devices.size() && !devices[selected].mac.empty())
+            if ((page == 2 && selected < devices.size()) || (page == 4 && selected < unknown.size()))
             {
-                auto& d  = devices[selected];
+                const auto& d = page == 2 ? devices[selected] : unknown[selected];
                 auto  it = std::find_if(known.begin(), known.end(),
                      [&](const auto& k)
                      {
-                        return k.mac == d.mac;
+                        return matchesKnown(d, k);
                     });
                 if (it == known.end())
                     known.push_back({ d.mac, "", d.name, d.ip, d.vendor });
@@ -2677,25 +2621,19 @@ try
             else if (page == 3)
                 known = loadKnown();
             else if (page == 4)
-                startInterfaces(state);
-            else if (page == 5)
-                startPrerequisites(state);
-            else if (page == 6)
             {
                 startDeviceScan(state);
-                startInterfaces(state);
                 selected = 0;
             }
-            else if (page == 7)
+            else if (page == 5)
+                startInterfaces(state);
+            else if (page == 6)
             {
                 startArpScan(state);
                 selected = 0;
             }
-            else if (page == 8 && !deepIp.empty())
-            {
-                startDeepProbe(state, deepIp);
-                selected = 0;
-            }
+            else if (page == 7)
+                startPrerequisites(state);
             break;
         default:
             break;
